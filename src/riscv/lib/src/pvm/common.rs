@@ -277,7 +277,7 @@ impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: block::Block<MC, M>, M: state_b
     /// (a possible case: the privilege mode access violation is treated in EE,
     /// but a page fault is not)
     // The conditional compilation below causes some warnings.
-    pub(crate) fn eval_max(&mut self, mut hooks: impl PvmHooks, step_bounds: Bound<usize>) -> usize
+    pub fn eval_max(&mut self, mut hooks: impl PvmHooks, step_bounds: Bound<usize>) -> usize
     where
         M: state_backend::ManagerReadWrite,
     {
@@ -328,7 +328,7 @@ impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: block::Block<MC, M>, M: state_b
 
     /// Provide an inbox message. Returns `false` if the machine state is not
     /// expecting a message.
-    pub(crate) fn provide_inbox_message(&mut self, level: u32, counter: u32, payload: &[u8]) -> bool
+    pub fn provide_inbox_message(&mut self, level: u32, counter: u32, payload: &[u8]) -> bool
     where
         M: state_backend::ManagerReadWrite,
     {
@@ -350,7 +350,7 @@ impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: block::Block<MC, M>, M: state_b
 
     /// Provide reveal data in response to a reveal request.
     /// Returns `false` if the machine is not expecting a reveal.
-    pub(crate) fn provide_reveal_response(&mut self, reveal_data: &[u8]) -> bool
+    pub fn provide_reveal_response(&mut self, reveal_data: &[u8]) -> bool
     where
         M: state_backend::ManagerReadWrite,
     {
@@ -366,7 +366,7 @@ impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: block::Block<MC, M>, M: state_b
     }
 
     /// Get the reveal request in the machine state.
-    pub(crate) fn reveal_request(&self) -> Vec<u8>
+    pub fn reveal_request(&self) -> Vec<u8>
     where
         M: state_backend::ManagerRead,
     {
