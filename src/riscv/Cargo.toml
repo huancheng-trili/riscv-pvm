@@ -56,19 +56,24 @@ memmap2 = "0.9.5"
 
 [workspace.dependencies.tezos-smart-rollup-constants]
 git = "https://gitlab.com/tezos/tezos.git"
+rev = "8a0a8d363b085e8d0b5fd89736158dc6d0c0c04f"
 
 [workspace.dependencies.tezos-smart-rollup-encoding]
 git = "https://gitlab.com/tezos/tezos.git"
+rev = "8a0a8d363b085e8d0b5fd89736158dc6d0c0c04f"
 
 [workspace.dependencies.tezos-smart-rollup-utils]
 git = "https://gitlab.com/tezos/tezos.git"
+rev = "8a0a8d363b085e8d0b5fd89736158dc6d0c0c04f"
 
 [workspace.dependencies.tezos-smart-rollup]
 git = "https://gitlab.com/tezos/tezos.git"
+rev = "8a0a8d363b085e8d0b5fd89736158dc6d0c0c04f"
 features = ["utils"]
 
 [workspace.dependencies.tezos_crypto_rs]
 git = "https://gitlab.com/tezos/tezos.git"
+rev = "8a0a8d363b085e8d0b5fd89736158dc6d0c0c04f"
 default-features = false
 
 [workspace.dependencies.strum]
