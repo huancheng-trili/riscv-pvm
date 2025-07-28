@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-mod reveals;
+pub mod reveals;
 
 use std::ops::Bound;
 use std::path::Path;
