@@ -4,13 +4,17 @@
 
 //! Branch of a tree that forms a Buddy-style memory manager
 
-use serde::Deserialize;
-use serde::Serialize;
+use bincode::Decode;
+use bincode::Encode;
+use bincode::de::Decoder;
+use bincode::enc::Encoder;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
+use perfect_derive::perfect_derive;
 
 use super::Buddy;
 use super::BuddyLayout;
 use crate::state::NewState;
-use crate::state_backend::AllocatedOf;
 use crate::state_backend::Atom;
 use crate::state_backend::Cell;
 use crate::state_backend::FnManager;
@@ -22,11 +26,10 @@ use crate::state_backend::ManagerRead;
 use crate::state_backend::ManagerReadWrite;
 use crate::state_backend::ManagerSerialise;
 use crate::state_backend::Ref;
-use crate::state_backend::verify_backend::Verifier;
 use crate::struct_layout;
 
 /// Information about what is free in each buddy
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct FreeInfo {
     /// Length of the longest sequence of free pages in the left buddy
     left_longest_free_sequence: u64,
@@ -55,10 +58,7 @@ struct_layout! {
     }
 }
 
-impl<B: BuddyLayout> BuddyLayout for BuddyBranch2Layout<B>
-where
-    AllocatedOf<B, Verifier>: 'static,
-{
+impl<B: BuddyLayout> BuddyLayout for BuddyBranch2Layout<B> {
     type Buddy<M: ManagerBase> = BuddyBranch2<B::Buddy<M>, M>;
 
     fn bind<M: ManagerBase>(space: Self::Allocated<M>) -> Self::Buddy<M> {
@@ -82,6 +82,7 @@ where
 }
 
 /// Branch in a Buddy-style memory manager tree
+#[perfect_derive(PartialEq, Eq)]
 pub struct BuddyBranch2<B, M: ManagerBase> {
     free_info: Cell<FreeInfo, M>,
     left: Box<B>,
@@ -295,38 +296,24 @@ where
     }
 }
 
-impl<B: Serialize, M: ManagerSerialise> Serialize for BuddyBranch2<B, M> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        BuddyBranch2LayoutF {
+impl<B: Encode, M: ManagerSerialise> Encode for BuddyBranch2<B, M> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        let values = BuddyBranch2LayoutF {
             free_info: &self.free_info,
             left: &self.left,
             right: &self.right,
-        }
-        .serialize(serializer)
+        };
+        Encode::encode(&values, encoder)
     }
 }
 
-impl<'de, B: Deserialize<'de>, M: ManagerDeserialise> Deserialize<'de> for BuddyBranch2<B, M> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let inner: BuddyBranch2LayoutF<_, _, _> = Deserialize::deserialize(deserializer)?;
+impl<B: Decode<()>, M: ManagerDeserialise> Decode<()> for BuddyBranch2<B, M> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let inner: BuddyBranch2LayoutF<_, _, _> = Decode::decode(decoder)?;
         Ok(Self {
             free_info: inner.free_info,
             left: inner.left,
             right: inner.right,
         })
-    }
-}
-
-impl<B: PartialEq, M: ManagerRead> PartialEq for BuddyBranch2<B, M> {
-    fn eq(&self, other: &Self) -> bool {
-        self.free_info.eq(&other.free_info)
-            && self.left.eq(&other.left)
-            && self.right.eq(&other.right)
     }
 }

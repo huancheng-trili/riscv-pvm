@@ -1,0 +1,44 @@
+[package]
+name = "riscv-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+default-run = "riscv-sandbox"
+
+[[bin]]
+name = "riscv-sandbox"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+cfg-if.workspace = true
+clap.workspace = true
+comfy-table.workspace = true
+enum-tag.workspace = true
+gdbstub.workspace = true
+gdbstub_arch.workspace = true
+itertools.workspace = true
+meansd.workspace = true
+numfmt.workspace = true
+object.workspace = true
+quanta.workspace = true
+rustc-demangle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tezos-smart-rollup-encoding.workspace = true
+tezos-smart-rollup.workspace = true
+
+[dependencies.octez-riscv]
+path = "../../src/riscv/lib"
+
+[dependencies.tracing-subscriber]
+workspace = true
+optional = true
+
+[features]
+default = []
+disable-jit = []
+inline-jit = []
+log = ["octez-riscv/log", "dep:tracing-subscriber"]

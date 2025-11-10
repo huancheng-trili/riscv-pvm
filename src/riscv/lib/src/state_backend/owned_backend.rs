@@ -1,20 +1,23 @@
-// SPDX-FileCopyrightText: 2024 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2024-2025 TriliTech <contact@trili.tech>
 // SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
 //
 // SPDX-License-Identifier: MIT
 
 use std::array;
-use std::fmt;
-use std::marker::PhantomData;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 
-use serde::ser::SerializeTuple;
+use bincode::Encode;
+use bincode::de::Decode;
+use bincode::de::Decoder;
+use bincode::de::read::Reader;
+use bincode::enc::Encoder;
+use bincode::enc::write::Writer;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
 
 use super::Elem;
-use super::EnrichedValue;
-use super::EnrichedValueLinked;
 use super::ManagerAlloc;
 use super::ManagerBase;
 use super::ManagerClone;
@@ -42,21 +45,9 @@ impl Owned {
 impl ManagerBase for Owned {
     type Region<E: 'static, const LEN: usize> = [E; LEN];
 
-    type DynRegion<const LEN: usize> = memmap2::MmapMut;
-
-    type EnrichedCell<V: EnrichedValue> = (V::E, V::D);
+    type DynRegion = memmap2::MmapMut;
 
     type ManagerRoot = Self;
-
-    fn enrich_cell<V: EnrichedValueLinked>(cell: Self::Region<V::E, 1>) -> Self::EnrichedCell<V> {
-        let [value] = cell;
-        let derived = V::derive(&value);
-        (value, derived)
-    }
-
-    fn as_devalued_cell<V: EnrichedValue>(cell: &Self::EnrichedCell<V>) -> &Self::Region<V::E, 1> {
-        array::from_ref(&cell.0)
-    }
 }
 
 impl ManagerAlloc for Owned {
@@ -64,8 +55,8 @@ impl ManagerAlloc for Owned {
         value
     }
 
-    fn allocate_dyn_region<const LEN: usize>() -> Self::DynRegion<LEN> {
-        let region = memmap2::MmapMut::map_anon(LEN).expect("Failed to allocate dynamic region");
+    fn allocate_dyn_region(len: usize) -> Self::DynRegion {
+        let region = memmap2::MmapMut::map_anon(len).expect("Failed to allocate dynamic region");
 
         assert_eq!(
             region.as_ptr().align_offset(PAGE_SIZE.get() as usize),
@@ -93,51 +84,14 @@ impl ManagerRead for Owned {
         region.to_vec()
     }
 
-    fn dyn_region_read<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-    ) -> E {
-        assert!(address + E::STORED_SIZE.get() <= LEN);
+    fn dyn_region_len(region: &Self::DynRegion) -> usize {
+        region.len()
+    }
 
-        // SAFETY: The assertion above ensures that the address can be read for at least
-        // `E::STORED_SIZE` bytes.
+    unsafe fn dyn_region_read<E: Elem>(region: &Self::DynRegion, address: usize) -> E {
+        debug_assert!(address + E::STORED_SIZE.get() <= region.len());
+
         unsafe { E::read_unaligned(region.as_ptr().add(address)) }
-    }
-
-    fn dyn_region_read_all<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-        values: &mut [E],
-    ) {
-        for (i, value) in values.iter_mut().enumerate() {
-            *value = Self::dyn_region_read::<E, LEN>(
-                region,
-                E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
-            );
-        }
-    }
-
-    fn enriched_cell_read_stored<V>(cell: &Self::EnrichedCell<V>) -> V::E
-    where
-        V: EnrichedValue,
-        V::E: Copy,
-    {
-        cell.0
-    }
-
-    fn enriched_cell_read_derived<V>(cell: &Self::EnrichedCell<V>) -> V::D
-    where
-        V: EnrichedValue,
-        V::D: Copy,
-    {
-        cell.1
-    }
-
-    fn enriched_cell_ref_stored<V>(cell: &Self::EnrichedCell<V>) -> &V::E
-    where
-        V: EnrichedValue,
-    {
-        &cell.0
     }
 }
 
@@ -157,40 +111,10 @@ impl ManagerWrite for Owned {
         region.copy_from_slice(value)
     }
 
-    fn dyn_region_write<E: Elem, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
-        address: usize,
-        value: E,
-    ) {
-        assert!(address + E::STORED_SIZE.get() <= LEN);
+    unsafe fn dyn_region_write<E: Elem>(region: &mut Self::DynRegion, address: usize, value: E) {
+        debug_assert!(address + E::STORED_SIZE.get() <= region.len());
 
-        // SAFETY: The assertion above ensures that the address can be written for at least
-        // `E::STORED_SIZE` bytes.
         unsafe { value.write_unaligned(region.as_mut_ptr().add(address)) }
-    }
-
-    fn dyn_region_write_all<E: Elem + Copy, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
-        address: usize,
-        values: &[E],
-    ) {
-        for (i, value) in values.iter().enumerate() {
-            Self::dyn_region_write::<E, LEN>(
-                region,
-                E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
-                *value,
-            );
-        }
-    }
-
-    fn enriched_cell_write<V>(cell: &mut Self::EnrichedCell<V>, value: V::E)
-    where
-        V: EnrichedValueLinked,
-    {
-        let derived = V::derive(&value);
-
-        cell.0 = value;
-        cell.1 = derived;
     }
 }
 
@@ -205,137 +129,52 @@ impl ManagerReadWrite for Owned {
 }
 
 impl ManagerSerialise for Owned {
-    fn serialise_region<E: serde::Serialize + 'static, const LEN: usize, S: serde::Serializer>(
-        region: &Self::Region<E, LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        // A special encoding for single-element regions helps clean up encoding for serialisation
-        // formats that contain structures. For example, JSON, where single-element regions would
-        // be represented as array singletons.
-        if LEN == 1 {
-            return region[0].serialize(serializer);
+    fn serialise_region<T: Encode + 'static, const LEN: usize, E: Encoder>(
+        region: &Self::Region<T, LEN>,
+        mut encoder: E,
+    ) -> Result<(), EncodeError> {
+        for elem in region.iter() {
+            elem.encode(&mut encoder)?;
         }
 
-        // We're serialising this as a fixed-sized tuple because otherwise `bincode` would prefix
-        // the length of this array, which is not needed.
-        let mut serializer = serializer.serialize_tuple(LEN)?;
-
-        for item in region.iter() {
-            serializer.serialize_element(item)?;
-        }
-
-        serializer.end()
+        Ok(())
     }
 
-    fn serialise_dyn_region<const LEN: usize, S: serde::Serializer>(
-        region: &Self::DynRegion<LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(region.deref())
+    fn serialise_dyn_region<E: Encoder>(
+        region: &Self::DynRegion,
+        mut encoder: E,
+    ) -> Result<(), EncodeError> {
+        let len = region.len() as u64;
+        len.encode(&mut encoder)?;
+
+        encoder.writer().write(region)
     }
 }
 
 impl ManagerDeserialise for Owned {
-    fn deserialise_region<
-        'de,
-        E: serde::de::Deserialize<'de> + 'static,
-        const LEN: usize,
-        D: serde::de::Deserializer<'de>,
-    >(
-        deserializer: D,
-    ) -> Result<Self::Region<E, LEN>, D::Error> {
-        // A special encoding for single-element regions helps clean up encoding for serialisation
-        // formats that contain structures. For example, JSON, where single-element regions would
-        // be represented as array singletons.
-        if LEN == 1 {
-            let values = unsafe {
-                let mut values: [MaybeUninit<E>; LEN] = mem::zeroed();
-                values[0].write(E::deserialize(deserializer)?);
-                values.map(|value| value.assume_init())
-            };
-            return Ok(values);
+    fn deserialise_region<T: Decode<()> + 'static, const LEN: usize, D: Decoder<Context = ()>>(
+        mut decoder: D,
+    ) -> Result<Self::Region<T, LEN>, DecodeError> {
+        let mut items = array::from_fn(|_| MaybeUninit::<T>::uninit());
+
+        for item in items.iter_mut() {
+            item.write(T::decode(&mut decoder)?);
         }
 
-        struct Inner<E, const LEN: usize>(PhantomData<E>);
-
-        impl<'de, E: serde::Deserialize<'de> + Sized, const LEN: usize> serde::de::Visitor<'de>
-            for Inner<E, LEN>
-        {
-            type Value = [E; LEN];
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "{}", std::any::type_name::<Self::Value>())
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut values: [MaybeUninit<E>; LEN] = array::from_fn(|_| MaybeUninit::uninit());
-
-                for value in values.iter_mut() {
-                    value.write(seq.next_element::<E>()?.ok_or_else(|| {
-                        serde::de::Error::custom(format!(
-                            "Not enough elements to construct {}",
-                            std::any::type_name::<Self::Value>()
-                        ))
-                    })?);
-                }
-
-                // We can't use `std::mem::transmute` here because `[_; LEN]` does not have a fixed
-                // size according to the compiler. I suspect this because `LEN` is a const generic
-                // parameter.
-                Ok(values.map(|value| {
-                    // SAFETY: We've initialised all the elements in the array.
-                    unsafe { value.assume_init() }
-                }))
-            }
-        }
-
-        deserializer.deserialize_tuple(LEN, Inner(PhantomData))
+        // SAFETY: We have iterated through all items and initialised them.
+        let values = items.map(|value| unsafe { value.assume_init() });
+        Ok(values)
     }
 
-    fn deserialise_dyn_region<'de, const LEN: usize, D: serde::de::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self::DynRegion<LEN>, D::Error> {
-        // The default borrowed bytes deserializer does not cover both the owned and borrowed
-        // cases. Hence we implement our own visitor that can handle both.
-        struct BytesVisitor<'a> {
-            target: &'a mut memmap2::MmapMut,
-        }
+    fn deserialise_dyn_region<'de, D: Decoder>(
+        mut decoder: D,
+    ) -> Result<Self::DynRegion, DecodeError> {
+        let len = u64::decode(&mut decoder)? as usize;
 
-        impl<'de> serde::de::Visitor<'de> for BytesVisitor<'_> {
-            type Value = ();
+        let mut target = Owned::allocate_dyn_region(len);
+        decoder.reader().read(&mut target)?;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "a byte slice")
-            }
-
-            fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.target.copy_from_slice(bytes);
-                Ok(())
-            }
-
-            fn visit_borrowed_bytes<E>(self, bytes: &'de [u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.target.copy_from_slice(bytes);
-                Ok(())
-            }
-        }
-
-        let mut region = Owned::allocate_dyn_region::<LEN>();
-
-        // This will deserialise, but also populate the region with the bytes.
-        deserializer.deserialize_bytes(BytesVisitor {
-            target: &mut region,
-        })?;
-
-        Ok(region)
+        Ok(target)
     }
 }
 
@@ -346,18 +185,11 @@ impl ManagerClone for Owned {
         region.clone()
     }
 
-    fn clone_dyn_region<const LEN: usize>(region: &Self::DynRegion<LEN>) -> Self::DynRegion<LEN> {
-        let mut new_region = Owned::allocate_dyn_region::<LEN>();
+    fn clone_dyn_region(region: &Self::DynRegion) -> Self::DynRegion {
+        let len = region.len();
+        let mut new_region = Owned::allocate_dyn_region(len);
         new_region.copy_from_slice(region.deref());
         new_region
-    }
-
-    fn clone_enriched_cell<V: EnrichedValue>(cell: &Self::EnrichedCell<V>) -> Self::EnrichedCell<V>
-    where
-        V::E: Clone,
-        V::D: Clone,
-    {
-        cell.clone()
     }
 }
 
@@ -367,12 +199,11 @@ pub(crate) mod test_helpers {
     use crate::state_backend::Cell;
     use crate::state_backend::Cells;
     use crate::state_backend::DynCells;
-    use crate::state_backend::EnrichedCell;
-    use crate::state_backend::FnManagerIdent;
     use crate::state_backend::Ref;
     use crate::state_backend::proof_backend::ProofDynRegion;
     use crate::state_backend::proof_backend::ProofGen;
     use crate::state_backend::proof_backend::ProofRegion;
+    use crate::storage::binary;
 
     /// Ensure [`Cell`] can be serialised and deserialised in a consistent way.
     #[test]
@@ -380,18 +211,18 @@ pub(crate) mod test_helpers {
         proptest::proptest!(|(value: u64)|{
             let region = [value; 1];
             let cell: Cell<u64, Owned> = Cell::bind(region);
-            let bytes = bincode::serialize(&cell).unwrap();
+            let bytes = binary::serialise(&cell).unwrap();
 
-            let cell_after: Cell<u64, Owned> = bincode::deserialize(&bytes).unwrap();
+            let cell_after: Cell<u64, Owned> = binary::deserialise(&bytes).unwrap();
             assert_eq!(cell.read(), cell_after.read());
 
-            let bytes_after = bincode::serialize(&cell_after).unwrap();
+            let bytes_after = binary::serialise(&cell_after).unwrap();
             assert_eq!(bytes, bytes_after);
 
             // Serialisation is consistent with that of the `ProofGen` backend.
             let proof_cell: Cell<u64, ProofGen<Ref<'_, Owned>>> =
                 Cell::bind(ProofRegion::bind(&region));
-            let proof_bytes = bincode::serialize(&proof_cell).unwrap();
+            let proof_bytes = binary::serialise(&proof_cell).unwrap();
             assert_eq!(bytes, proof_bytes);
         });
     }
@@ -401,9 +232,9 @@ pub(crate) mod test_helpers {
     fn cells_serialise() {
         proptest::proptest!(|(a: u64, b: u64, c: u64)|{
             let cell: Cells<u64, 3, Owned> = Cells::bind([a, b, c]);
-            let bytes = bincode::serialize(&cell).unwrap();
+            let bytes = binary::serialise(&cell).unwrap();
 
-            let cell_after: Cells<u64, 3, Owned> = bincode::deserialize(&bytes).unwrap();
+            let cell_after: Cells<u64, 3, Owned> = binary::deserialise(&bytes).unwrap();
 
             assert_eq!(cell.read_all(), cell_after.read_all());
 
@@ -411,13 +242,13 @@ pub(crate) mod test_helpers {
                 assert_eq!(cell.read(i), cell_after.read(i));
             }
 
-            let bytes_after = bincode::serialize(&cell_after).unwrap();
+            let bytes_after = binary::serialise(&cell_after).unwrap();
             assert_eq!(bytes, bytes_after);
 
             // Serialisation is consistent with that of the `ProofGen` backend.
             let proof_cells: Cells<u64, 3, ProofGen<Ref<'_, Owned>>> =
                 Cells::bind(ProofRegion::bind(cell.region_ref()));
-            let proof_bytes = bincode::serialize(&proof_cells).unwrap();
+            let proof_bytes = binary::serialise(&proof_cells).unwrap();
             assert_eq!(bytes, proof_bytes);
         });
     }
@@ -425,105 +256,31 @@ pub(crate) mod test_helpers {
     /// Ensure [`DynCells`] can be serialised and deserialised in a consistent way.
     #[test]
     fn dyn_cells_serialise() {
-        proptest::proptest!(|(address in (0usize..120), value: u64)|{
-            let mapping = Owned::allocate_dyn_region::<128>();
-            let mut cells: DynCells<128, Owned> = DynCells::bind(mapping);
-            cells.write(address, value);
-            let bytes = bincode::serialize(&cells).unwrap();
+        proptest::proptest!(|(address in (0usize..120), value: u64)| {
+            let mapping = Owned::allocate_dyn_region(128);
+            let mut cells: DynCells<Owned> = DynCells::bind(mapping);
 
-            let cells_after: DynCells<128, Owned> = bincode::deserialize(&bytes).unwrap();
-            for i in 0..128 {
-                assert_eq!(cells.read::<u8>(i), cells_after.read::<u8>(i));
+            unsafe {
+                cells.write(address, value);
             }
 
-            let bytes_after = bincode::serialize(&cells_after).unwrap();
+            let bytes = binary::serialise(&cells).unwrap();
+
+            let cells_after: DynCells<Owned> = binary::deserialise(&bytes).unwrap();
+            for i in 0..128 {
+                unsafe {
+                    assert_eq!(cells.read::<u8>(i), cells_after.read::<u8>(i));
+                }
+            }
+
+            let bytes_after = binary::serialise(&cells_after).unwrap();
             assert_eq!(bytes, bytes_after);
 
             // Serialisation is consistent with that of the `ProofGen` backend.
-            let proof_cells: DynCells<128, ProofGen<Ref<'_, Owned>>> =
+            let proof_cells: DynCells<ProofGen<Ref<'_, Owned>>> =
                 DynCells::bind(ProofDynRegion::bind(cells.region_ref()));
-            let proof_bytes = bincode::serialize(&proof_cells).unwrap();
+            let proof_bytes = binary::serialise(&proof_cells).unwrap();
             assert_eq!(bytes, proof_bytes);
-        });
-    }
-
-    /// Ensure [`EnrichedCell`] can be serialised and deserialised in a consistent way.
-    #[test]
-    fn enriched_cell_serialise() {
-        pub struct Enriching;
-
-        impl EnrichedValue for Enriching {
-            type E = u64;
-            type D = T;
-        }
-
-        #[derive(Clone, Copy)]
-        pub struct T(u64);
-
-        impl<'a> From<&'a u64> for T {
-            fn from(value: &'a u64) -> Self {
-                T(value.wrapping_add(1))
-            }
-        }
-
-        proptest::proptest!(|(value: u64)| {
-            let cell = Cell::bind([0u64]);
-            let mut cell: EnrichedCell<Enriching, Owned> = EnrichedCell::bind(cell);
-            cell.write(value);
-
-            let read_value = cell.read_ref_stored();
-
-            assert_eq!(value, *read_value);
-            let bytes = bincode::serialize(&cell).unwrap();
-
-            let cell_after: EnrichedCell<Enriching, Owned> = bincode::deserialize(&bytes).unwrap();
-
-            assert_eq!(*cell.read_ref_stored(), *cell_after.read_ref_stored());
-
-            let derived = cell.read_derived();
-            let derived_after = cell_after.read_derived();
-
-            assert_eq!(T::from(read_value).0, derived.0);
-            assert_eq!(derived.0, derived_after.0);
-
-            // Serialisation is consistent with that of the `ProofGen` backend.
-            let proof_cell: EnrichedCell<Enriching, Ref<'_, Owned>> = EnrichedCell::bind(cell.struct_ref::<FnManagerIdent>());
-            let proof_bytes = bincode::serialize(&proof_cell).unwrap();
-            assert_eq!(bytes, proof_bytes);
-        });
-    }
-
-    /// Ensure [`EnrichedCell`] is serialized identically to [`Cell`].
-    #[test]
-    fn enriched_cell_serialise_match_cell() {
-        pub struct Enriching;
-        pub struct Fun;
-
-        impl EnrichedValue for Enriching {
-            type E = u64;
-            type D = Fun;
-        }
-
-        impl<'a> From<&'a u64> for Fun {
-            fn from(_value: &'a u64) -> Self {
-                Self
-            }
-        }
-
-        proptest::proptest!(|(value: u64)| {
-            let cell = Cell::bind([0u64]);
-            let mut ecell: EnrichedCell<Enriching, Owned> = EnrichedCell::bind(cell);
-            let mut cell: Cell<u64, Owned> = Cell::bind([0; 1]);
-            ecell.write(value);
-            cell.write(value);
-
-            assert_eq!(value, ecell.read_stored());
-            assert_eq!(value, cell.read());
-
-            let ebytes = bincode::serialize(&ecell).unwrap();
-            let cbytes = bincode::serialize(&cell).unwrap();
-
-            assert_eq!(ebytes, cbytes, "Serializing EnrichedCell and Cell should match");
         });
     }
 
@@ -532,9 +289,9 @@ pub(crate) mod test_helpers {
     #[test]
     fn cell_direct_serialise() {
         let cell: Cell<u64, Owned> = Cell::bind([42]);
-        let json_value = serde_json::to_value(cell).unwrap();
-        let expected_json_value = serde_json::json!(42);
-        assert_eq!(json_value, expected_json_value);
+        let binary_value = binary::serialise(cell).unwrap();
+        let expected_binary_value = binary::serialise(42u64).unwrap();
+        assert_eq!(binary_value, expected_binary_value);
     }
 
     /// Check that regions are properly initialised.

@@ -1,27 +1,35 @@
-// SPDX-FileCopyrightText: 2024 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2024-2025 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
 //
 // SPDX-License-Identifier: MIT
 
-mod common;
-
 use std::ops::Bound;
 
-use common::*;
-use octez_riscv::machine_state::block_cache::DefaultCacheConfig;
-use octez_riscv::machine_state::block_cache::block::InterpretedBlockBuilder;
 use octez_riscv::machine_state::memory::M64M;
+use octez_riscv::machine_state::memory::MemoryConfig;
+use octez_riscv::machine_state::page_cache::InterpretedCompiler;
 use octez_riscv::pvm::PvmLayout;
 use octez_riscv::pvm::hooks::NoHooks;
+use octez_riscv::state_backend::CloneLayout;
 use octez_riscv::state_backend::RefOwnedAlloc;
 use octez_riscv::state_backend::hash;
 use octez_riscv::stepper::Stepper;
 use octez_riscv::stepper::StepperStatus;
 use octez_riscv::stepper::pvm::PvmStepper;
+use octez_riscv_test_utils::*;
 
 #[test]
-#[ignore]
 fn test_jstz_determinism() {
-    let make_stepper = make_stepper_factory();
+    test_determinism(JSTZ)
+}
+
+#[test]
+fn test_etherlink_determinism() {
+    test_determinism(ETHERLINK)
+}
+
+fn test_determinism(inputs: TestConfig) {
+    let make_stepper = make_stepper_factory(&inputs);
 
     let mut base_stepper = make_stepper();
     let base_result = base_stepper.step_max(Bound::Unbounded);
@@ -43,26 +51,32 @@ fn test_jstz_determinism() {
 
     // Create multiple series of bisections that we will evaluate.
     let ladder = dissect_steps(steps, 0);
-    run_steps_ladder(&make_stepper, &ladder, &base_refs, base_hash);
+    run_steps_ladder::<M64M, _>(&make_stepper, &ladder, &base_refs, base_hash);
 }
 
-fn run_steps_ladder<F>(
+fn run_steps_ladder<MC, F>(
     make_stepper: F,
     ladder: &[usize],
-    expected_refs: &RefOwnedAlloc<PvmLayout<M64M, DefaultCacheConfig>>,
+    expected_refs: &RefOwnedAlloc<PvmLayout<MC>>,
     expected_hash: hash::Hash,
 ) where
-    F: Fn() -> PvmStepper<NoHooks, M64M, DefaultCacheConfig>,
+    MC: MemoryConfig,
+    PvmLayout<MC>: CloneLayout,
+    for<'a> RefOwnedAlloc<'a, PvmLayout<MC>>: PartialEq,
+    F: Fn() -> PvmStepper<NoHooks, MC>,
 {
     let expected_steps = ladder.iter().sum::<usize>();
     let mut stepper_lhs = make_stepper();
     let mut stepper_rhs = make_stepper();
 
-    assert_eq_struct(&stepper_lhs.struct_ref(), &stepper_rhs.struct_ref());
+    assert!(
+        stepper_lhs.struct_ref() == stepper_rhs.struct_ref(),
+        "Stepper states have diverged before doing anything"
+    );
 
     let mut steps_done = 0;
     for &steps in ladder {
-        eprintln!("> Running {} steps ...", steps);
+        eprintln!("> Running {steps} steps ...");
         let result_lhs = stepper_lhs.step_max(Bound::Included(steps));
         let result_rhs = stepper_rhs.step_max(Bound::Included(steps));
         steps_done += steps;
@@ -80,44 +94,26 @@ fn run_steps_ladder<F>(
             steps,
             result_lhs.steps()
         );
-        assert_eq_struct(&stepper_lhs.struct_ref(), &stepper_rhs.struct_ref());
+        assert!(
+            stepper_lhs.struct_ref() == stepper_rhs.struct_ref(),
+            "Stepper states have diverged after running {steps} steps"
+        );
 
-        let block_builder = InterpretedBlockBuilder;
-        stepper_lhs.rebind_via_clone(block_builder);
+        let compiler = InterpretedCompiler;
+        stepper_lhs.rebind_via_clone(compiler);
     }
 
-    assert_eq_struct_wrapper(stepper_lhs.struct_ref(), expected_refs);
+    assert_eq_struct_wrapper::<MC>(stepper_lhs.struct_ref(), expected_refs);
     assert_eq!(stepper_lhs.hash(), expected_hash);
     assert_eq!(stepper_rhs.hash(), expected_hash);
 }
 
-fn assert_eq_struct<A, B>(lhs: &A, rhs: &B)
-where
-    A: serde::Serialize + PartialEq<B>,
-    B: serde::Serialize,
+fn assert_eq_struct_wrapper<'a, 'regions1, 'regions2, MC: MemoryConfig>(
+    refs: RefOwnedAlloc<'regions1, PvmLayout<MC>>,
+    expected: &'a RefOwnedAlloc<'regions2, PvmLayout<MC>>,
+) where
+    RefOwnedAlloc<'regions2, PvmLayout<MC>>: PartialEq,
 {
-    if lhs != rhs {
-        eprintln!("> State mismatch, generating diff ...");
-
-        let (file_lhs, path_lhs) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
-        serde_json::to_writer(file_lhs, lhs).unwrap();
-        eprintln!("Lhs is located at {}", path_lhs.display());
-
-        let (file_rhs, path_rhs) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
-        serde_json::to_writer(file_rhs, rhs).unwrap();
-        eprintln!("Rhs is located at {}", path_rhs.display());
-
-        eprintln!("Run the following to diff them:");
-        eprintln!("jd {} {}", path_lhs.display(), path_rhs.display());
-
-        panic!("Assertion failed: values are different");
-    }
-}
-
-fn assert_eq_struct_wrapper<'a, 'regions1, 'regions2>(
-    refs: RefOwnedAlloc<'regions1, PvmLayout<M64M, DefaultCacheConfig>>,
-    expected: &'a RefOwnedAlloc<'regions2, PvmLayout<M64M, DefaultCacheConfig>>,
-) {
     // SAFETY: Rust does not allow us to compare two references with different lifetimes.
     // Theoretically this should be possible and safe thanks to `PartialEq`. However, Rust's
     // subtyping rules seem to influence trait-implementation selection for our `AllocatedOf<...>`
@@ -126,7 +122,6 @@ fn assert_eq_struct_wrapper<'a, 'regions1, 'regions2>(
     // the `==` operator need to be identical in type. This also means lifetimes are forcibly
     // unified. We can work around this by transmuting the references to the same lifetime. This is
     // safe because lifetimes are not violated as dictated by the interface of this function.
-    let refs: RefOwnedAlloc<'regions2, PvmLayout<M64M, DefaultCacheConfig>> =
-        unsafe { std::mem::transmute(refs) };
-    assert_eq_struct(&refs, expected);
+    let refs: RefOwnedAlloc<'regions2, PvmLayout<MC>> = unsafe { std::mem::transmute(refs) };
+    assert!(&refs == expected);
 }

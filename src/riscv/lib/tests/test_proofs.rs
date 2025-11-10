@@ -3,77 +3,108 @@
 //
 // SPDX-License-Identifier: MIT
 
-mod common;
+// This ensures that Clippy does't apply rules which are allowed in tests.
+#![cfg(test)]
 
 use std::io::Write;
 use std::ops::Bound;
 use std::time::Instant;
 
-use common::*;
-use octez_riscv::machine_state::block_cache::BlockCacheConfig;
-use octez_riscv::machine_state::block_cache::DefaultCacheConfig;
-use octez_riscv::machine_state::block_cache::TestCacheConfig;
-use octez_riscv::machine_state::block_cache::block::Interpreted;
 use octez_riscv::machine_state::memory::M64M;
 use octez_riscv::machine_state::memory::MemoryConfig;
+use octez_riscv::machine_state::page_cache::Interpreted;
 use octez_riscv::pvm::hooks::NoHooks;
-use octez_riscv::state_backend::AllocatedOf;
 use octez_riscv::state_backend::hash;
 use octez_riscv::state_backend::owned_backend::Owned;
 use octez_riscv::state_backend::proof_backend::proof::Proof;
 use octez_riscv::state_backend::proof_backend::proof::serialise_proof;
+use octez_riscv::state_backend::verify_backend::NotFound;
 use octez_riscv::state_backend::verify_backend::ProofVerificationFailure;
-use octez_riscv::state_backend::verify_backend::Verifier;
 use octez_riscv::stepper::Stepper;
 use octez_riscv::stepper::StepperStatus;
 use octez_riscv::stepper::pvm::PvmStepper;
+use octez_riscv_test_utils::*;
 use rand::Rng;
 
+// Jstz tests
+
 #[test]
-#[ignore]
 fn test_jstz_proofs_one_step() {
-    test_jstz_proofs(false, PvmStepper::verify_proof)
+    test_proofs::<M64M>(false, PvmStepper::verify_proof, JSTZ)
 }
 
 #[test]
-#[ignore]
 fn test_jstz_proofs_one_step_stream() {
-    test_jstz_proofs(false, PvmStepper::verify_proof_using_raw_bytes)
+    test_proofs::<M64M>(false, PvmStepper::verify_proof_using_raw_bytes, JSTZ)
 }
 
 #[test]
 #[ignore]
 fn test_jstz_proofs_full() {
-    test_jstz_proofs(true, PvmStepper::verify_proof)
+    test_proofs::<M64M>(true, PvmStepper::verify_proof, JSTZ)
 }
 
 #[test]
 #[ignore]
 fn test_jstz_proofs_full_stream() {
-    test_jstz_proofs(true, PvmStepper::verify_proof_using_raw_bytes)
+    test_proofs::<M64M>(true, PvmStepper::verify_proof_using_raw_bytes, JSTZ)
 }
 
 #[test]
 fn test_jstz_initial_proof_regression() {
-    // Configuring the stepper with `TestCachelayouts` to match the node PVM
-    // and make the test run faster.
-    let make_stepper = make_stepper_factory::<TestCacheConfig>();
+    test_initial_proof_regression(JSTZ)
+}
+
+// Etherlink tests
+
+#[test]
+fn test_etherlink_proofs_one_step() {
+    test_proofs::<M64M>(false, PvmStepper::verify_proof, ETHERLINK)
+}
+
+#[test]
+fn test_etherlink_proofs_one_step_stream() {
+    test_proofs::<M64M>(false, PvmStepper::verify_proof_using_raw_bytes, ETHERLINK)
+}
+
+#[test]
+#[ignore]
+fn test_etherlink_proofs_full() {
+    test_proofs::<M64M>(true, PvmStepper::verify_proof, ETHERLINK)
+}
+
+#[test]
+#[ignore]
+fn test_etherlink_proofs_full_stream() {
+    test_proofs::<M64M>(true, PvmStepper::verify_proof_using_raw_bytes, ETHERLINK)
+}
+
+#[test]
+fn test_etherlink_initial_proof_regression() {
+    test_initial_proof_regression(ETHERLINK)
+}
+
+fn test_initial_proof_regression(inputs: TestConfig) {
+    let make_stepper = make_stepper_factory::<M64M>(&inputs);
     let mut stepper = make_stepper();
 
     eprintln!("> Producing proof ...");
     let proof = stepper.produce_proof().unwrap();
-    let proof_serialisation: Vec<u8> = serialise_proof(&proof).collect();
+    let proof_serialisation: Vec<u8> = serialise_proof(&proof);
 
     // This file is also used in the tests for the OCaml `lib_riscv` library
-    let mut mint = goldenfile::Mint::new("tests/expected/jstz");
+    let mut mint = goldenfile::Mint::new(inputs.golden_dir);
     let mut proof_capture = mint.new_goldenfile("proof_initial").unwrap();
 
     let proof_bytes = hex::encode(proof_serialisation);
     writeln!(proof_capture, "{proof_bytes}").unwrap();
 }
 
-fn test_jstz_proofs(full: bool, verify_fn: StepperVerifyFn<M64M, DefaultCacheConfig, Owned>) {
-    let make_stepper = make_stepper_factory::<DefaultCacheConfig>();
+fn test_proofs<MC>(full: bool, verify_fn: StepperVerifyFn<MC, Owned>, inputs: TestConfig)
+where
+    MC: MemoryConfig,
+{
+    let make_stepper = make_stepper_factory::<MC>(&inputs);
 
     let mut base_stepper = make_stepper();
     let base_result = base_stepper.step_max(Bound::Unbounded);
@@ -95,13 +126,14 @@ fn test_jstz_proofs(full: bool, verify_fn: StepperVerifyFn<M64M, DefaultCacheCon
     }
 }
 
-fn run_steps_ladder<F>(
+fn run_steps_ladder<MC, F>(
     make_stepper: F,
     ladder: &[usize],
     expected_hash: Option<hash::Hash>,
-    verify_fn: StepperVerifyFn<M64M, DefaultCacheConfig, Owned>,
+    verify_fn: StepperVerifyFn<MC, Owned>,
 ) where
-    F: Fn() -> PvmStepper<NoHooks, M64M, DefaultCacheConfig>,
+    MC: MemoryConfig,
+    F: Fn() -> PvmStepper<NoHooks, MC>,
 {
     let expected_steps = ladder.iter().sum::<usize>();
     let mut stepper = make_stepper();
@@ -110,7 +142,7 @@ fn run_steps_ladder<F>(
     for &steps in ladder {
         // Run one step short of `steps`, then produce a proof of the following step.
         let steps = steps.checked_sub(1).expect("minimum step size is 1");
-        eprintln!("> Running {} steps ...", steps);
+        eprintln!("> Running {steps} steps ...");
         let result = stepper.step_max(Bound::Included(steps));
         steps_done += steps;
 
@@ -121,11 +153,14 @@ fn run_steps_ladder<F>(
             let start = Instant::now();
             let proof = stepper.produce_proof().unwrap();
             let time = start.elapsed();
-            let serialisation: Vec<u8> = serialise_proof(&proof).collect();
-            eprintln!(
-                "> Proof of size {} KiB produced in {:?}",
-                serialisation.len() / 1024,
-                time
+
+            let serialisation: Vec<u8> = serialise_proof(&proof);
+            let proof_size_kib = serialisation.len() / 1024;
+
+            eprintln!("> Proof of size {proof_size_kib} KiB produced in {time:?}");
+            assert!(
+                proof_size_kib < 20,
+                "Proof size is too large ({proof_size_kib} KiB) when running {ladder:?}"
             );
 
             eprintln!("> Checking initial proof hash ...");
@@ -138,7 +173,7 @@ fn run_steps_ladder<F>(
             basic_invalid_proofs_are_rejected(&stepper, &proof, initial_state_hash, verify_fn);
 
             eprintln!("> Verifying proof ...");
-            assert!(verify_fn(&stepper, proof).is_ok());
+            verify_fn(&stepper, proof).unwrap();
 
             // Run one final step, which is the step proven by `proof`, and check that its
             // state hash matches the final state hash of `proof`.
@@ -165,39 +200,39 @@ fn run_steps_ladder<F>(
     }
 }
 
-type StepperVerifyFn<MC, BCC, M> = fn(
-    &PvmStepper<NoHooks, MC, BCC, M, Interpreted<MC, M>>,
+type StepperVerifyFn<MC, M> = fn(
+    &PvmStepper<NoHooks, MC, M, Interpreted<MC, M>>,
     proof: Proof,
 ) -> Result<(), ProofVerificationFailure>;
 
-fn basic_invalid_proofs_are_rejected<MC: MemoryConfig, BCC: BlockCacheConfig>(
-    stepper: &PvmStepper<NoHooks, MC, BCC>,
+fn basic_invalid_proofs_are_rejected<MC: MemoryConfig>(
+    stepper: &PvmStepper<NoHooks, MC>,
     proof: &Proof,
     state_hash: hash::Hash,
-    verify_fn: StepperVerifyFn<MC, BCC, Owned>,
-) where
-    AllocatedOf<BCC::Layout, Verifier>: 'static,
-{
+    verify_fn: StepperVerifyFn<MC, Owned>,
+) {
     // A fully blinded proof could only be valid if every single leaf
     // in the state is written to and proof compression were to optimise
     // for this case.
     let fully_blinded_proof = proof_helpers::fully_blinded(state_hash);
-    assert!(
-        verify_fn(stepper, fully_blinded_proof)
-            .is_err_and(|e| matches!(e, ProofVerificationFailure::AbsentDataAccess(_)))
-    );
+    assert!(matches!(
+        verify_fn(stepper, fully_blinded_proof),
+        Err(ProofVerificationFailure::AbsentDataAccess(NotFound))
+    ));
 
+    // The empty proof is not actually an absent proof. Because there is a root node, the tag
+    // deserialisation will fail because it will expect at least two tags.
     let empty_proof = proof_helpers::empty(state_hash);
-    assert!(
-        verify_fn(stepper, empty_proof)
-            .is_err_and(|e| matches!(e, ProofVerificationFailure::UnexpectedProofShape))
-    );
+    assert!(matches!(
+        verify_fn(stepper, empty_proof),
+        Err(ProofVerificationFailure::BadDeserialisation(_))
+    ));
 
     let invalid_final_hash_proof = proof_helpers::with_final_hash(proof, state_hash);
-    assert!(
-        verify_fn(stepper, invalid_final_hash_proof)
-            .is_err_and(|e| matches!(e, ProofVerificationFailure::FinalHashMismatch { .. }))
-    );
+    assert!(matches!(
+        verify_fn(stepper, invalid_final_hash_proof),
+        Err(ProofVerificationFailure::FinalHashMismatch { .. })
+    ));
 }
 
 mod proof_helpers {

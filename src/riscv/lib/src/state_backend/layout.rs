@@ -43,10 +43,10 @@ impl<T: 'static, const LEN: usize> Layout for Array<T, LEN> {
 }
 
 /// Layout for a fixed number of bytes, readable as types implementing [`super::elems::Elem`].
-pub struct DynArray<const LEN: usize> {}
+pub struct DynArray {}
 
-impl<const LEN: usize> Layout for DynArray<LEN> {
-    type Allocated<M: super::ManagerBase> = super::DynCells<LEN, M>;
+impl Layout for DynArray {
+    type Allocated<M: super::ManagerBase> = super::DynCells<M>;
 }
 
 /// Usage: Provide a struct with each field holding a layout.
@@ -76,7 +76,7 @@ macro_rules! struct_layout {
         }
     ) => {
         paste::paste! {
-            #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq)]
+            #[derive(bincode::Encode, bincode::Decode, Debug, Clone, PartialEq, Eq)]
             $(
                 #[$attributes]
             )*
@@ -115,7 +115,7 @@ macro_rules! struct_layout {
 
             impl <
                 $(
-                    [<$field_name:camel>]: $crate::state_backend::proof_backend::merkle::AccessInfoAggregatable + serde::Serialize
+                    [<$field_name:camel>]: $crate::state_backend::proof_backend::merkle::AccessInfoAggregatable + bincode::Encode
                 ),+
             > $crate::state_backend::proof_backend::merkle::AccessInfoAggregatable for [<$layout_t F>]<
                 $(
@@ -146,11 +146,11 @@ macro_rules! struct_layout {
                 fn state_hash<M: $crate::state_backend::ManagerRead + $crate::state_backend::ManagerSerialise>(
                     state: $crate::state_backend::AllocatedOf<Self, M>
                 ) -> std::result::Result<$crate::storage::Hash, $crate::storage::HashError> {
-                    $crate::storage::Hash::combine(&[
+                    Ok($crate::storage::Hash::combine([
                         $(
                             [<$field_name:camel>]::state_hash(state.$field_name)?
                         ),+
-                    ])
+                    ]))
                 }
             }
 
@@ -163,45 +163,41 @@ macro_rules! struct_layout {
                     [<$field_name:camel>]
                 ),+
             >
-            where
-            $(
-                $crate::state_backend::AllocatedOf<[<$field_name:camel>], $crate::state_backend::verify_backend::Verifier>: 'static
-            ),+
             {
                 #[inline]
                 fn to_merkle_tree(
                     state: $crate::state_backend::RefProofGenOwnedAlloc<Self>,
                 ) -> std::result::Result<$crate::state_backend::proof_backend::merkle::MerkleTree, $crate::storage::HashError> {
-                    $crate::state_backend::proof_backend::merkle::MerkleTree::make_merkle_node(
+                    Ok($crate::state_backend::proof_backend::merkle::MerkleTree::make_merkle_node(
                         vec![
                             $(
                                 [<$field_name:camel>]::to_merkle_tree(state.$field_name)?
                             ),+
                         ]
-                    )
+                    ))
                 }
 
                 #[inline]
                 fn into_verifier_alloc<D: $crate::state_backend::proof_backend::proof::deserialiser::Deserialiser>(
                     proof: D,
                 ) -> $crate::state_backend::VerifierAllocResult<D, Self> {
-
                     use $crate::state_backend::proof_layout::tuple_branches_proof_layout;
                     use $crate::state_backend::proof_backend::proof::deserialiser::DeserialiserNode;
+                    use $crate::state_backend::proof_backend::proof::deserialiser::Suspended;
 
-                    let ctx = tuple_branches_proof_layout!(@no_done; proof $(, [<$field_name:camel>])+);
+                    let result = tuple_branches_proof_layout!(proof $(, [<$field_name:camel>])+)?;
 
-                    let ctx = ctx.map(|(res, merkle)| {
-                        let ( $($field_name,)+ ) = res;
-                        let allocated = Self::Allocated {
+                    let result = result.map(|values| {
+                        let ( $($field_name),+ ) = values;
+
+                        Self::Allocated {
                             $(
                                 $field_name
                             ),+
-                        };
-                        (allocated, merkle)
+                        }
                     });
 
-                    ctx.done()
+                    Ok(result)
                 }
 
                 #[inline]
@@ -420,8 +416,8 @@ mod tests {
             assert_eq!(hash, tree_root_hash);
 
             // Produce a proof
-            let proof = tree.to_merkle_proof().unwrap();
-            let proof_hash = proof.root_hash().unwrap();
+            let proof = tree.to_merkle_proof();
+            let proof_hash = proof.root_hash();
             assert_eq!(hash, proof_hash);
 
             // Apply the same modification on the `Owned` state in order to obtain

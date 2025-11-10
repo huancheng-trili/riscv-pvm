@@ -5,9 +5,9 @@
 
 use std::fmt;
 
+use bincode::Decode;
+use bincode::Encode;
 use enum_tag::EnumTag;
-use serde::Deserialize;
-use serde::Serialize;
 
 use super::XRegisterParsed;
 use crate::default::ConstDefault;
@@ -17,7 +17,7 @@ use crate::machine_state::registers::FRegister;
 use crate::machine_state::registers::NonZeroXRegister;
 use crate::machine_state::registers::XRegister;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct RTypeArgs {
     pub rd: XRegister,
     pub rs1: XRegister,
@@ -25,21 +25,21 @@ pub struct RTypeArgs {
 }
 
 /// Intermediate representation of Args for R-type instructions with guaranteed `rd` != `x0`.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct NonZeroRdRTypeArgs {
     pub rd: NonZeroXRegister,
     pub rs1: XRegister,
     pub rs2: XRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct ITypeArgs {
     pub rd: XRegister,
     pub rs1: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct NonZeroITypeArgs {
     pub rd: NonZeroXRegister,
     pub rs1: NonZeroXRegister,
@@ -47,61 +47,61 @@ pub struct NonZeroITypeArgs {
 }
 
 /// Intermediate representation of Args for I-type instructions with parsed split of registers.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct SplitITypeArgs {
     pub(crate) rd: XRegisterParsed,
     pub(crate) rs1: XRegisterParsed,
     pub imm: i64,
 }
 /// Intermediate representation of Args for I-type instructions with guaranteed `rd` != `x0`.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct NonZeroRdITypeArgs {
     pub rd: NonZeroXRegister,
     pub rs1: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct SBTypeArgs {
     pub rs1: XRegister,
     pub rs2: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct NonZeroSBTypeArgs {
     pub rs1: NonZeroXRegister,
     pub rs2: NonZeroXRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct UJTypeArgs {
     pub rd: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct NonZeroRdUJTypeArgs {
     pub rd: NonZeroXRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CsrArgs {
     pub rd: XRegister,
     pub rs1: XRegister,
     pub csr: CSRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CsriArgs {
     pub rd: XRegister,
     pub imm: i64,
     pub csr: CSRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FenceSet {
     pub i: bool,
     pub o: bool,
@@ -109,46 +109,46 @@ pub struct FenceSet {
     pub w: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FenceArgs {
     pub pred: FenceSet,
     pub succ: FenceSet,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FRegToXRegArgs {
     pub rd: XRegister,
     pub rs1: FRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct XRegToFRegArgs {
     pub rd: FRegister,
     pub rs1: XRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct XRegToFRegArgsWithRounding {
     pub rd: FRegister,
     pub rs1: XRegister,
     pub rm: InstrRoundingMode,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FRegToXRegArgsWithRounding {
     pub rd: XRegister,
     pub rs1: FRegister,
     pub rm: InstrRoundingMode,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FCmpArgs {
     pub rs1: FRegister,
     pub rs2: FRegister,
     pub rd: XRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FRArgs {
     pub rs1: FRegister,
     pub rs2: FRegister,
@@ -156,7 +156,7 @@ pub struct FRArgs {
 }
 
 /// There are 6 supported rounding modes that an instruction may use.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub enum InstrRoundingMode {
     Dynamic,
     Static(RoundingMode),
@@ -165,20 +165,21 @@ pub enum InstrRoundingMode {
 impl InstrRoundingMode {
     /// Read the parsing mode from the byte given
     pub const fn from_rm(rm: u32) -> Option<Self> {
-        if rm == 0b111 {
-            Some(Self::Dynamic)
-        } else {
-            match RoundingMode::from_csrrepr(rm as u64) {
-                Ok(rm) => Some(Self::Static(rm)),
-                _ => None,
-            }
+        match rm {
+            0b000 => Some(Self::Static(RoundingMode::RNE)),
+            0b001 => Some(Self::Static(RoundingMode::RTZ)),
+            0b010 => Some(Self::Static(RoundingMode::RDN)),
+            0b011 => Some(Self::Static(RoundingMode::RUP)),
+            0b100 => Some(Self::Static(RoundingMode::RMM)),
+            0b111 => Some(Self::Dynamic),
+            _ => None,
         }
     }
 }
 
 /// Floating-point R-type instruction, containing
 /// rounding mode, and one input argument.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FR1ArgWithRounding {
     pub rs1: FRegister,
     pub rm: InstrRoundingMode,
@@ -187,7 +188,7 @@ pub struct FR1ArgWithRounding {
 
 /// Floating-point R-type instruction, containing
 /// rounding mode, and two input arguments.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FR2ArgsWithRounding {
     pub rs1: FRegister,
     pub rs2: FRegister,
@@ -197,7 +198,7 @@ pub struct FR2ArgsWithRounding {
 
 /// Floating-point R-type instruction, containing
 /// rounding mode, and three input arguments.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FR3ArgsWithRounding {
     pub rs1: FRegister,
     pub rs2: FRegister,
@@ -206,14 +207,14 @@ pub struct FR3ArgsWithRounding {
     pub rd: FRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FStoreArgs {
     pub rs1: XRegister,
     pub rs2: FRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct FLoadArgs {
     pub rs1: XRegister,
     pub rd: FRegister,
@@ -222,7 +223,7 @@ pub struct FLoadArgs {
 
 // R-type instructions with 2 additional bits which specify memory ordering
 // constraints as viewed by other RISC-V harts
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct AmoArgs {
     pub rd: XRegister,
     pub rs1: XRegister,
@@ -233,65 +234,68 @@ pub struct AmoArgs {
 
 // Compressed instruction types
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CRTypeArgs {
     pub rd_rs1: XRegister,
     pub rs2: XRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CNZRTypeArgs {
     pub rd_rs1: NonZeroXRegister,
     pub rs2: NonZeroXRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CRJTypeArgs {
     pub rs1: NonZeroXRegister,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CJTypeArgs {
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CIBTypeArgs {
     pub rd_rs1: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CIBNZTypeArgs {
     pub rd_rs1: NonZeroXRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CIBDTypeArgs {
     pub rd_rs1: FRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CSSTypeArgs {
     pub rs2: XRegister,
     pub imm: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encode, Decode)]
 pub struct CSSDTypeArgs {
     pub rs2: FRegister,
     pub imm: i64,
 }
 
 /// RISC-V parsed instructions. Along with legal instructions, potentially
-/// illegal instructions are parsed as `Unknown` or `UnknownCompressed`.
-/// These instructions are successfully parsed, but must not be interpreted.
-#[derive(
-    Debug, PartialEq, Eq, Clone, Copy, EnumTag, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub enum InstrCacheable {
+///
+/// Illegal instructions are parsed as `Unknown` or `UnknownCompressed`.
+///
+/// These instructions are successfully parsed, but will raise an
+/// [`IllegalInstruction`] exception if run.
+///
+/// [`IllegalInstruction`]: crate::exceptions::Exception::IllegalInstruction
+#[derive(Debug, PartialEq, Eq, Clone, Copy, EnumTag, Hash, Encode, Decode)]
+pub enum Instr {
     // RV64I R-type instructions
     /// `ADD` - Perform `val(rs1) + val(rs2)` and store the result in `rd`
     Add(NonZeroRdRTypeArgs),
@@ -436,12 +440,12 @@ pub enum InstrCacheable {
     Auipc(NonZeroRdUJTypeArgs),
 
     // RV64I jump instructions
-    /// `JAL` (note: uncompressed variant) - Instruction mis-aligned will
+    /// `JAL` (note: uncompressed variant) - Instruction misaligned will
     /// never be thrown because we allow C extension
     ///
     /// Always returns the target address (current program counter + imm)
     Jal(UJTypeArgs),
-    /// `JALR` (note: uncompressed variant) - Instruction mis-aligned will
+    /// `JALR` (note: uncompressed variant) - Instruction misaligned will
     /// never be thrown because we allow C extension
     ///
     /// Always returns the target address (val(rs1) + imm)
@@ -650,8 +654,6 @@ pub enum InstrCacheable {
     Fcvtdwu(XRegToFRegArgsWithRounding),
     Fcvtdl(XRegToFRegArgsWithRounding),
     /// `FCVT.D.LU` - Converts a 64 bit unsigned integer into a 64 bit float, with rounding.
-    ///
-    /// Returns `Exception::IllegalInstruction` on an invalid rounding mode.
     Fcvtdlu(XRegToFRegArgsWithRounding),
     Fcvtds(FR1ArgWithRounding),
     Fcvtsd(FR1ArgWithRounding),
@@ -828,67 +830,33 @@ pub enum InstrCacheable {
     Wfi,
 
     Ecall,
-}
-
-impl ConstDefault for InstrCacheable {
-    const DEFAULT: Self = Self::Unknown { instr: 0 };
-}
-
-/// Uncacheable instructions are those that may result in a
-/// breaking of the normal flow of execution.
-///
-/// Namely, that may happen due:
-/// - interrupt control flow
-/// - cache invalidation
-/// - altering the mapping of virtual to physical memory
-///
-/// Any of these can result in breaking the 'default flow of execution',
-/// invalidating the assumptions that are required for the [`BlockCache`] to
-/// function.
-///
-/// [`BlockCache`]: crate::machine_state::block_cache::BlockCache
-#[derive(Debug, PartialEq, Eq, Clone, Copy, EnumTag, Hash)]
-pub enum InstrUncacheable {
-    Fence(FenceArgs),
-    FenceTso(FenceArgs),
     Ebreak,
-
-    // RV32C compressed instructions
     CEbreak,
 
-    // Zifencei instructions
+    Fence(FenceArgs),
+    FenceTso,
     FenceI,
 }
 
-/// RISC-V parsed instructions.
-///
-/// Along with legal instructions, potentially
-/// illegal instructions are parsed as `Instr::Cacheable::(InstrCacheable::Unknown)`
-/// or `Instr::Cacheable::(InstrCacheable::UnknownCompressed)`.
-/// These instructions are successfully parsed, but must not be interpreted.
-///
-/// Any `Instr::Cacheable` may be written to & fetched from the Instruction Cache.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, EnumTag, Hash)]
-pub enum Instr {
-    Cacheable(InstrCacheable),
-    Uncacheable(InstrUncacheable),
+impl ConstDefault for Instr {
+    const DEFAULT: Self = Self::Unknown { instr: 0 };
 }
 
 /// RISC-V instruction width.
 ///
 /// This is either 4 bytes, in the case of an uncompressed instruction,
 /// or 2 bytes, in the case of a compressed instruction.
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize, Hash)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Encode, Decode, Hash)]
 pub enum InstrWidth {
     Compressed = 2,
     Uncompressed = 4,
 }
 
-impl InstrCacheable {
+impl Instr {
     /// Return the width of the instruction in bytes.
     #[inline(always)]
     pub const fn width(&self) -> InstrWidth {
-        use InstrCacheable::*;
+        use Instr::*;
         match self {
             // 4 bytes instructions
             Add(_)
@@ -1046,6 +1014,10 @@ impl InstrCacheable {
             | Unknown { instr: _ }
             | Wfi
             | Ecall
+            | Ebreak
+            | Fence(_)
+            | FenceTso
+            | FenceI
             | Hint { instr: _ } => InstrWidth::Uncompressed,
 
             // 2 bytes instructions (compressed instructions)
@@ -1085,33 +1057,9 @@ impl InstrCacheable {
             | CFldsp(_)
             | CFsd(_)
             | CFsdsp(_)
+            | CEbreak
             | UnknownCompressed { instr: _ }
             | HintCompressed { instr: _ } => InstrWidth::Compressed,
-        }
-    }
-}
-
-impl InstrUncacheable {
-    /// Return the width of the instruction in bytes.
-    #[inline(always)]
-    pub const fn width(&self) -> InstrWidth {
-        use InstrUncacheable::*;
-        match self {
-            FenceI | Fence(_) | FenceTso(_) | Ebreak => InstrWidth::Uncompressed,
-
-            CEbreak => InstrWidth::Compressed,
-        }
-    }
-}
-
-impl Instr {
-    /// Return the width of the instruction in bytes.
-    #[inline(always)]
-    pub const fn width(&self) -> InstrWidth {
-        use Instr::*;
-        match self {
-            Cacheable(c) => c.width(),
-            Uncacheable(u) => u.width(),
         }
     }
 }
@@ -1282,16 +1230,16 @@ impl fmt::Display for FenceSet {
         if out.is_empty() {
             write!(f, "unknown")
         } else {
-            write!(f, "{}", out)
+            write!(f, "{out}")
         }
     }
 }
 
 /// An objdump-style prettyprinter for parsed instructions, used in testing
 /// the parser against objdump.
-impl fmt::Display for InstrCacheable {
+impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use InstrCacheable::*;
+        use Instr::*;
         match self {
             // RV64I R-type instructions
             Add(args) => r_instr!(f, "add", args),
@@ -1533,41 +1481,21 @@ impl fmt::Display for InstrCacheable {
             CFsd(args) => write!(f, "c.fsd {},{}({})", args.rs2, args.imm, args.rs1),
             CFsdsp(args) => cs_instr_sp!(f, "c.fsdsp", args),
 
-            Unknown { instr } => write!(f, "unknown {:x}", instr),
-            UnknownCompressed { instr } => write!(f, "unknown.c {:x}", instr),
+            Unknown { instr } => write!(f, "unknown {instr:x}"),
+            UnknownCompressed { instr } => write!(f, "unknown.c {instr:x}"),
 
-            Hint { instr } => write!(f, "hint {:x}", instr),
-            HintCompressed { instr } => write!(f, "hint.c {:x}", instr),
+            Hint { instr } => write!(f, "hint {instr:x}"),
+            HintCompressed { instr } => write!(f, "hint.c {instr:x}"),
             // Interrupt-management
             Wfi => write!(f, "wfi"),
+
             Ecall => write!(f, "ecall"),
-        }
-    }
-}
-
-impl fmt::Display for InstrUncacheable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use InstrUncacheable::*;
-        match self {
-            Fence(args) => fence_instr!(f, "fence", args),
-            FenceTso(args) => fence_instr!(f, "fence.tso", args),
-
             Ebreak => write!(f, "ebreak"),
-
-            // Zifencei instructions
-            FenceI => write!(f, "fence.i"),
-
-            // Compressed
             CEbreak => write!(f, "c.ebreak"),
-        }
-    }
-}
 
-impl fmt::Display for Instr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cacheable(i) => i.fmt(f),
-            Self::Uncacheable(i) => i.fmt(f),
+            Fence(args) => fence_instr!(f, "fence", args),
+            FenceTso => write!(f, "fence.tso rw,rw"),
+            FenceI => write!(f, "fence.i"),
         }
     }
 }

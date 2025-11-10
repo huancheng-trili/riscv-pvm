@@ -26,36 +26,49 @@ use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::Block;
 use cranelift::prelude::FunctionBuilder;
 use cranelift::prelude::InstBuilder;
+use cranelift::prelude::isa::TargetFrontendConfig;
 use cranelift::prelude::types::I32;
 use cranelift::prelude::types::I64;
 use cranelift::prelude::types::I128;
 
+use crate::exceptions::Exception;
 use crate::instruction_context::ICB;
 use crate::instruction_context::MulHighType;
-use crate::instruction_context::Predicate;
 use crate::instruction_context::StoreLoadInt;
-use crate::instruction_context::arithmetic::Arithmetic;
-use crate::instruction_context::comparable::Comparable;
 use crate::instruction_context::value::PhiValue;
-use crate::interpreter::atomics;
-use crate::interpreter::atomics::ReservationSetOption;
 use crate::interpreter::float::RoundingMode;
 use crate::jit::builder::typed::Pointer;
+use crate::jit::builder::typed::Typed;
 use crate::jit::builder::typed::Value;
+use crate::jit::state_access::ExceptionCode;
 use crate::jit::state_access::JsaCalls;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::ProgramCounterUpdate;
+use crate::machine_state::csregisters::CSRegister;
 use crate::machine_state::memory::Address;
 use crate::machine_state::memory::MemoryConfig;
-use crate::machine_state::registers::FRegister;
+use crate::machine_state::registers::FValue;
 use crate::machine_state::registers::XValue;
 use crate::machine_state::registers::XValue32;
 use crate::parser::instruction::InstrWidth;
 use crate::state_backend::owned_backend::Owned;
 use crate::state_context::StateContext;
 use crate::state_context::projection::MachineCoreProjection;
-use crate::traps::EnvironException;
-use crate::traps::Exception;
+
+/// Probability of taking an outcome of a particular instruction.
+///
+/// As detailed in RISC-V Control Transfer Instructions specification (2.5),
+/// backward-branches should be treated as likely taken, while forward-branches
+/// should be treated as likely not-taken. Also, exception handlers should be treated
+/// as likely not-taken (except for a few instructions, such as `ECall`, which are guaranteed to
+/// result in an exception).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OutcomeProbability {
+    Guaranteed,
+    High,
+    Low,
+}
 
 /// Instruction execution outcome
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -96,19 +109,27 @@ pub enum Outcome {
 /// Lowered RISC-V instruction
 pub struct LoweredInstruction {
     /// Location of the instruction
-    program_counter: Value<Address>,
+    program_counter: Address,
 
     /// Block that runs the instruction
     run_block: Block,
 
     /// Execution outcomes of the instruction
     outcomes: Vec<Outcome>,
+
+    /// Width of the instruction
+    width: InstrWidth,
 }
 
 impl LoweredInstruction {
     /// Access the program counter for this instruction.
-    pub fn program_counter(&self) -> Value<Address> {
+    pub fn program_counter(&self) -> Address {
         self.program_counter
+    }
+
+    /// Return the address of the instruction following this one.
+    pub fn next_instruction_address(&self) -> Address {
+        self.program_counter.wrapping_add(self.width as u64)
     }
 
     /// Access the outcomes of the instruction.
@@ -133,39 +154,52 @@ pub enum InstructionResult<T> {
 
 /// Builder for a single RISC-V instruction
 pub struct InstructionBuilder<'seq, 'jit, MC: MemoryConfig> {
+    /// Target configuration for the JIT module
+    target_config: TargetFrontendConfig,
+
     /// IR builder
     builder: &'seq mut FunctionBuilder<'jit>,
 
     /// External function call manager
-    ext_calls: &'seq mut JsaCalls<'jit, MC>,
+    ext_calls: &'seq mut JsaCalls<MC>,
 
     /// Block that starts the instruction
     entry_block: Block,
 
     /// Program counter for the instruction being built
-    instruction_pc: Value<Address>,
+    instruction_pc: Address,
 
     /// Parameter pointing to the `MachineCoreState`
     core_param: Pointer<MachineCoreState<MC, Owned>>,
 
     /// Parameter pointing to the sequence result
-    result_param: Pointer<Result<(), EnvironException>>,
+    result_param: Pointer<ExceptionCode>,
 
     /// Execution outcomes of the instruction
     outcomes: Vec<Outcome>,
+
+    /// Width of the instruction being built
+    width: InstrWidth,
 }
 
 impl<'seq, 'jit, MC: MemoryConfig> InstructionBuilder<'seq, 'jit, MC> {
     /// Create a new instruction builder.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "All parameters are required to define a new instruction builder."
+    )]
     pub(super) fn new(
+        target_config: TargetFrontendConfig,
         builder: &'seq mut FunctionBuilder<'jit>,
-        ext_calls: &'seq mut JsaCalls<'jit, MC>,
+        ext_calls: &'seq mut JsaCalls<MC>,
         entry_block: Block,
-        instruction_pc: Value<Address>,
+        instruction_pc: Address,
         core_param: Pointer<MachineCoreState<MC, Owned>>,
-        result_param: Pointer<Result<(), EnvironException>>,
+        result_param: Pointer<ExceptionCode>,
+        width: InstrWidth,
     ) -> Self {
         Self {
+            target_config,
             builder,
             ext_calls,
             entry_block,
@@ -173,6 +207,7 @@ impl<'seq, 'jit, MC: MemoryConfig> InstructionBuilder<'seq, 'jit, MC> {
             core_param,
             result_param,
             outcomes: Vec::new(),
+            width,
         }
     }
 
@@ -195,42 +230,12 @@ impl<'seq, 'jit, MC: MemoryConfig> InstructionBuilder<'seq, 'jit, MC> {
         hook
     }
 
-    /// Allocate an outcome block for an unknown branch.
-    fn create_unknown_branch_outcome(&mut self, destination: Value<Address>) -> Block {
-        let hook = self.builder.create_block();
-        self.outcomes
-            .push(Outcome::UnknownBranch { destination, hook });
-        hook
-    }
-
     /// Handle an exception raised by the instruction.
-    fn handle_exception<Any>(
-        &mut self,
-        exception_ptr: Pointer<Exception>,
-    ) -> InstructionResult<Any> {
-        let current_pc = self.pc_read();
-        let outcome = self.ext_calls.handle_exception(
-            self.builder,
-            self.core_param,
-            exception_ptr,
-            self.result_param,
-            current_pc,
-        );
+    fn handle_exception<Any>(&mut self, exception: Value<ExceptionCode>) -> InstructionResult<Any> {
+        self.result_param.write(self.builder, exception);
 
         let exception_block = self.create_exception_outcome();
-        let unknown_branch_block = self.create_unknown_branch_outcome(outcome.new_pc);
-
-        self.ins().brif(
-            outcome.handled.to_value(),
-            unknown_branch_block,
-            [],
-            exception_block,
-            [],
-        );
-
-        // The predecessors of either block are now known
-        self.builder.seal_block(exception_block);
-        self.builder.seal_block(unknown_branch_block);
+        self.builder.ins().jump(exception_block, []);
 
         InstructionResult::NoNext
     }
@@ -244,6 +249,7 @@ impl<'seq, 'jit, MC: MemoryConfig> InstructionBuilder<'seq, 'jit, MC> {
             program_counter: self.instruction_pc,
             run_block: self.entry_block,
             outcomes: self.outcomes,
+            width: self.width,
         };
 
         // Hook up the end of the instruction.
@@ -283,7 +289,7 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
 
     type XValue32 = Value<XValue32>;
 
-    type FValue = Value<f64>;
+    type FValue = Value<FValue>;
 
     type Bool = Value<bool>;
 
@@ -314,19 +320,16 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         unsafe { Value::<XValue>::from_raw(raw) }
     }
 
-    fn fregister_read(&mut self, reg: FRegister) -> Self::FValue {
-        self.ext_calls
-            .ir_freg_read(self.builder, self.core_param, reg)
-    }
-
-    fn fregister_write(&mut self, reg: FRegister, value: Self::FValue) {
-        // The value contained must be a floating-point type.
-        self.ext_calls
-            .ir_freg_write(self.builder, self.core_param, reg, value)
-    }
-
     fn pc_read(&mut self) -> Self::XValue {
-        self.instruction_pc
+        // SAFETY: `I64` is the valid cranelift representation for an `Address`, and matches
+        // the representation of `XValue`.
+        unsafe {
+            Value::<XValue>::from_discriminant(
+                &self.target_config,
+                self.builder,
+                self.instruction_pc as i64,
+            )
+        }
     }
 
     fn bool_and(&mut self, lhs: Self::Bool, rhs: Self::Bool) -> Self::Bool {
@@ -407,7 +410,30 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         ProgramCounterUpdate::Next(instr_width)
     }
 
-    fn branch_merge<Phi: PhiValue, OnTrue, OnFalse>(
+    fn if_then<OnTrue>(&mut self, cond: Self::Bool, true_branch: OnTrue) -> Self::IResult<()>
+    where
+        OnTrue: FnOnce(&mut Self) -> Self::IResult<()>,
+    {
+        let true_block = self.builder.create_block();
+        let false_block = self.builder.create_block();
+
+        self.ins()
+            .brif(cond.to_value(), true_block, [], false_block, []);
+        self.builder.seal_block(true_block);
+        self.builder.seal_block(false_block);
+
+        // Code for true
+        {
+            self.builder.switch_to_block(true_block);
+            (true_branch)(self);
+        }
+
+        // Code for false
+        self.builder.switch_to_block(false_block);
+        InstructionResult::HasNext(())
+    }
+
+    fn if_then_else<Phi: PhiValue, OnTrue, OnFalse>(
         &mut self,
         cond: Self::Bool,
         true_branch: OnTrue,
@@ -464,60 +490,6 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         }
     }
 
-    fn atomic_access_fault_guard<V: StoreLoadInt>(
-        &mut self,
-        address: Self::XValue,
-        reservation_set_option: ReservationSetOption,
-    ) -> Self::IResult<()> {
-        let width = self.xvalue_of_imm(V::WIDTH as i64);
-        let remainder = address.modulus_unsigned(width, self);
-
-        // The steps of taking the comparison are technically not needed, as cranelift will
-        // treat any non-zero value as a take-branch (i.e. raise exception) value, so we could
-        // pass the remainder directly. However for completeness and clarity, we are keeping the
-        // comparison here.
-        let zero = self.xvalue_of_imm(0);
-        let not_aligned = remainder.compare(zero, Predicate::NotEqual, self);
-
-        let exception_block = self.builder.create_block();
-        let success_block = self.builder.create_block();
-
-        self.ins().brif(
-            not_aligned.to_value(),
-            exception_block,
-            [],
-            success_block,
-            [],
-        );
-
-        self.builder.seal_block(exception_block);
-        self.builder.seal_block(success_block);
-
-        // Code for when the address is not aligned
-        {
-            self.builder.switch_to_block(exception_block);
-
-            if let ReservationSetOption::Reset = reservation_set_option {
-                // If the atomic operation was a store_conditional, we reset the reservation.
-                atomics::reset_reservation_set(self);
-            }
-
-            let exception_ptr = self
-                .ext_calls
-                .raise_store_amo_access_fault_exception(self.builder, address);
-            self.handle_exception::<()>(exception_ptr);
-        }
-
-        self.builder.switch_to_block(success_block);
-
-        InstructionResult::HasNext(())
-    }
-
-    fn ecall(&mut self) -> Self::IResult<ProgramCounterUpdate<Self::XValue>> {
-        let exception_ptr = self.ext_calls.ecall(self.builder);
-        self.handle_exception(exception_ptr)
-    }
-
     fn main_memory_store<V: StoreLoadInt>(
         &mut self,
         phys_address: Self::XValue,
@@ -530,8 +502,9 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         let exception_block = self.builder.create_block();
         let success_block = self.builder.create_block();
 
+        let is_exception = errno.code.is_exception(self.builder);
         self.ins().brif(
-            errno.is_exception.to_value(),
+            is_exception.to_value(),
             exception_block,
             [],
             success_block,
@@ -544,13 +517,7 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         // Code for when the store failed
         {
             self.builder.switch_to_block(exception_block);
-
-            // SAFETY: When the memory store external function call encounters an error, it will
-            // write to the exception pointer. This block handles such a failure case, so we can
-            // assume that the pointee is initialised.
-            let exception_ptr = unsafe { errno.exception_ptr.assume_init() };
-
-            self.handle_exception::<()>(exception_ptr);
+            self.handle_exception::<()>(errno.code);
         }
 
         // Code for when the store succeeded
@@ -573,8 +540,9 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         let exception_block = self.builder.create_block();
         let success_block = self.builder.create_block();
 
+        let is_exception = errno.code.is_exception(self.builder);
         self.ins().brif(
-            errno.is_exception.to_value(),
+            is_exception.to_value(),
             exception_block,
             [],
             success_block,
@@ -588,12 +556,7 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         {
             self.builder.switch_to_block(exception_block);
 
-            // SAFETY: When the memory load external function call encounters an error, it will
-            // write to the exception pointer. This block handles such a failure case, so we can
-            // assume that the pointee is initialised.
-            let exception_ptr = unsafe { errno.exception_ptr.assume_init() };
-
-            self.handle_exception::<()>(exception_ptr);
+            self.handle_exception::<()>(errno.code);
         }
 
         // Code for when the load succeeded
@@ -609,11 +572,9 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         InstructionResult::HasNext(val)
     }
 
-    fn err_illegal_instruction<In>(&mut self) -> Self::IResult<In> {
-        let exception_ptr = self
-            .ext_calls
-            .raise_illegal_instruction_exception(self.builder);
-        self.handle_exception(exception_ptr)
+    fn raise_exception<In>(&mut self, exception: Exception) -> Self::IResult<In> {
+        let code = ExceptionCode::build_exception_code(self.builder, exception);
+        self.handle_exception(code)
     }
 
     fn map<Value, Next, F>(res: Self::IResult<Value>, f: F) -> Self::IResult<Next>
@@ -636,45 +597,9 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         }
     }
 
-    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::IResult<Self::FValue> {
-        let errno =
-            self.ext_calls
-                .f64_from_x64_unsigned_dynamic(self.builder, self.core_param, xval);
-
-        let exception_block = self.builder.create_block();
-        let success_block = self.builder.create_block();
-
-        self.ins().brif(
-            errno.is_exception.to_value(),
-            exception_block,
-            [],
-            success_block,
-            [],
-        );
-
-        // All inputs to these blocks are already known, so we can seal them immediately.
-        self.builder.seal_block(exception_block);
-        self.builder.seal_block(success_block);
-
-        // Code for when an exception was raised.
-        {
-            self.builder.switch_to_block(exception_block);
-
-            // SAFETY: When the external function call encounters an error, it will write to the
-            // exception pointer. This block handles such a failure case, so we can assume that the
-            // pointee is initialised.
-            let exception_ptr = unsafe { errno.exception_ptr.assume_init() };
-
-            self.handle_exception::<()>(exception_ptr);
-        }
-
-        // Code for when the conversion succeeded.
-        {
-            self.builder.switch_to_block(success_block);
-
-            let return_value = (errno.on_ok)(self.builder);
-            InstructionResult::HasNext(return_value)
-        }
+    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::FValue {
+        self.ext_calls
+            .f64_from_x64_unsigned_dynamic(self.builder, self.core_param, xval)
     }
 
     fn f64_from_x64_unsigned_static(
@@ -685,22 +610,38 @@ impl<MC: MemoryConfig> ICB for InstructionBuilder<'_, '_, MC> {
         self.ext_calls
             .f64_from_x64_unsigned_static(self.builder, self.core_param, xval, rm)
     }
+
+    fn csr_read(&mut self, reg: CSRegister) -> Self::XValue {
+        self.ext_calls.csr_read(self.builder, self.core_param, reg)
+    }
+
+    fn csr_write(&mut self, reg: CSRegister, value: Self::XValue) {
+        self.ext_calls
+            .csr_write(self.builder, self.core_param, reg, value);
+    }
 }
 
 impl<MC: MemoryConfig> StateContext for InstructionBuilder<'_, '_, MC> {
-    type X64 = Value<XValue>;
+    type Value<R> = Value<R>;
 
-    fn read_proj<P>(&mut self, param: P::Parameter) -> Self::X64
+    fn read_proj<P>(&mut self, param: P::Parameter) -> Self::Value<P::Target>
     where
-        P: MachineCoreProjection<Target = u64>,
+        P: MachineCoreProjection,
+        P::Target: Typed,
     {
-        super::read_proj::<MC, P>(self.builder, self.core_param, param)
+        super::read_proj::<MC, P>(&self.target_config, self.builder, self.core_param, param)
     }
 
-    fn write_proj<P>(&mut self, param: P::Parameter, value: Self::X64)
+    fn write_proj<P>(&mut self, param: P::Parameter, value: Self::Value<P::Target>)
     where
-        P: MachineCoreProjection<Target = u64>,
+        P: MachineCoreProjection,
     {
-        super::write_proj::<MC, P>(self.builder, self.core_param, param, value)
+        super::write_proj::<MC, P>(
+            &self.target_config,
+            self.builder,
+            self.core_param,
+            param,
+            value,
+        )
     }
 }

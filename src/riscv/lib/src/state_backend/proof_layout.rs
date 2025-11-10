@@ -5,6 +5,12 @@
 
 use std::collections::VecDeque;
 
+use bincode::Decode;
+use bincode::Encode;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
+use perfect_derive::perfect_derive;
+
 use super::AllocatedOf;
 use super::Array;
 use super::Atom;
@@ -23,41 +29,53 @@ use super::proof_backend::merkle::MerkleTree;
 use super::proof_backend::merkle::MerkleWriter;
 use super::proof_backend::merkle::build_custom_merkle_tree;
 use super::proof_backend::merkle::chunks_to_writer;
-use super::proof_backend::proof::DeserialiseError;
 use super::proof_backend::proof::MerkleProof;
 use super::proof_backend::proof::MerkleProofLeaf;
 use super::proof_backend::proof::deserialiser::Deserialiser;
 use super::proof_backend::proof::deserialiser::DeserialiserNode;
+use super::proof_backend::proof::deserialiser::Result;
 use super::proof_backend::proof::deserialiser::Suspended;
 use super::proof_backend::tree::Tree;
+use super::verify_backend;
 use super::verify_backend::PartialState;
 use super::verify_backend::Verifier;
-use super::verify_backend::{self};
 use crate::array_utils::boxed_array;
+use crate::state_backend::proof_backend::proof::InvalidTagError;
+use crate::state_backend::proof_backend::proof::NotEnoughBytesError;
 use crate::state_backend::proof_backend::proof::deserialiser::Partial;
 use crate::state_backend::verify_backend::PageId;
 use crate::storage::binary;
 
-/// Errors that may occur when parsing a Merkle proof
-#[derive(Debug, thiserror::Error)]
-pub enum FromProofError {
-    #[error("Error during hashing: {0}")]
-    Hash(#[from] HashError),
+/// Errors occurring when parsing the tag structure of a Merkle proof.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum TagError {
+    #[error("Invalid tag encountered: {0}")]
+    InvalidTag(#[from] InvalidTagError),
 
+    #[error("Not enough bytes available")]
+    NotEnoughBytes(#[from] NotEnoughBytesError),
+}
+
+/// Errors occurring when parsing a Merkle proof
+#[derive(Debug, thiserror::Error)]
+pub enum ProofError {
     #[error("Error during deserialisation: {0}")]
-    Deserialise(#[from] bincode::Error),
+    Deserialise(#[from] DecodeError),
+
+    #[error("Not enough bytes")]
+    NotEnoughBytes(#[from] NotEnoughBytesError),
+
+    #[error("Deserialising as a stream and not all bytes were consumed")]
+    RemainingBytes,
 
     #[error("Error during tag deserialisation: {0}")]
-    TagDeserialise(#[from] DeserialiseError),
+    TagDeserialise(#[from] TagError),
 
     #[error("Proof tree is absent")]
     AbsentProof,
 
-    #[error("Deserialising as a stream and not all bytes are parsed")]
-    RemainingBytes,
-
-    #[error("Encountered an invalid hash in a blinded node or leaf")]
-    InvalidHash,
+    #[error("A part of the proof required to parse further is absent")]
+    DependentNodeIsAbsent,
 
     #[error("Encountered a node with a bad number of branches: expected {expected}, got {got}")]
     BadNumberOfBranches { expected: usize, got: usize },
@@ -72,11 +90,9 @@ pub enum FromProofError {
     UnexpectedNode,
 }
 
-type Result<T, E = FromProofError> = std::result::Result<T, E>;
-
 /// Common result type for parsing a Merkle proof.
 pub(crate) type VerifierAllocResult<D, L> =
-    Result<<D as Deserialiser>::Suspended<(VerifierAlloc<L>, OwnedProofPart)>>;
+    Result<<D as Deserialiser>::Suspended<VerifierAlloc<L>>>;
 
 /// Regions for the verifier backend for a specific layout.
 pub type VerifierAlloc<L> = <L as Layout>::Allocated<verify_backend::Verifier>;
@@ -84,11 +100,13 @@ pub type VerifierAlloc<L> = <L as Layout>::Allocated<verify_backend::Verifier>;
 /// Errors that may occur when hashing a [`verify_backend::Verifier`] state
 #[derive(Debug, thiserror::Error)]
 pub enum PartialHashError {
-    #[error("Error during hashing: {0}")]
-    Hash(#[from] HashError),
+    /// The hash could not be computed because encoding a value to bytes failed. The byte
+    /// representation is used as input to the hash function.
+    #[error("Error while encoding a to-be-hashed value: {0}")]
+    Encode(#[from] EncodeError),
 
     #[error("Error from proof: {0}")]
-    FromProof(#[from] FromProofError),
+    FromProof(#[from] ProofError),
 
     /// Indicates that a hash could not be computed due to absent data,
     /// but from which it is possible to recover if the level at which
@@ -105,6 +123,7 @@ pub enum PartialHashError {
 
 /// Part of a tree that may be absent
 #[derive(Debug, PartialEq)]
+#[perfect_derive(Clone, Copy)]
 pub enum ProofPart<'a, T: ?Sized> {
     /// This part of the tree is absent.
     Absent,
@@ -112,14 +131,6 @@ pub enum ProofPart<'a, T: ?Sized> {
     /// There is a proof for this part of the tree.
     Present(&'a T),
 }
-
-impl<T> Clone for ProofPart<'_, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> Copy for ProofPart<'_, T> {}
 
 /// Part of a Merkle proof tree
 pub type ProofTree<'a> = ProofPart<'a, MerkleProof>;
@@ -137,7 +148,7 @@ impl<'a> ProofTree<'a> {
             Tree::Node(branches) => {
                 let branches: &[MerkleProof; LEN] =
                     branches.as_slice().try_into().map_err(|_| {
-                        FromProofError::BadNumberOfBranches {
+                        ProofError::BadNumberOfBranches {
                             got: branches.len(),
                             expected: LEN,
                         }
@@ -157,7 +168,7 @@ impl<'a> ProofTree<'a> {
 
             Tree::Leaf(leaf) => match leaf {
                 MerkleProofLeaf::Blind(_hash) => Ok(boxed_array![ProofTree::Absent; LEN]),
-                _ => Err(FromProofError::UnexpectedLeaf)?,
+                _ => Err(ProofError::UnexpectedLeaf)?,
             },
         }
     }
@@ -166,7 +177,7 @@ impl<'a> ProofTree<'a> {
     pub fn into_leaf(self) -> Result<ProofPart<'a, [u8]>> {
         if let ProofTree::Present(proof) = self {
             match proof {
-                Tree::Node(_) => Err(FromProofError::UnexpectedNode),
+                Tree::Node(_) => Err(ProofError::UnexpectedNode),
                 Tree::Leaf(leaf) => match leaf {
                     MerkleProofLeaf::Blind(_) => Ok(ProofPart::Absent),
                     MerkleProofLeaf::Read(data) => Ok(ProofPart::Present(data.as_slice())),
@@ -186,12 +197,12 @@ impl<'a> ProofTree<'a> {
         };
 
         let Tree::Leaf(leaf) = proof else {
-            return Err(FromProofError::UnexpectedNode.into());
+            return Err(ProofError::UnexpectedNode.into());
         };
 
         let hash = match leaf {
             MerkleProofLeaf::Blind(hash) => *hash,
-            MerkleProofLeaf::Read(data) => Hash::blake2b_hash_bytes(data)?,
+            MerkleProofLeaf::Read(data) => Hash::blake3_hash_bytes(data),
         };
 
         Ok(hash)
@@ -214,7 +225,7 @@ impl<'a> ProofTree<'a> {
 
         match proof {
             Tree::Node(branches) if branches.len() != LEN => Err(PartialHashError::FromProof(
-                FromProofError::BadNumberOfBranches {
+                ProofError::BadNumberOfBranches {
                     got: branches.len(),
                     expected: LEN,
                 },
@@ -233,7 +244,7 @@ impl<'a> ProofTree<'a> {
                 MerkleProofLeaf::Blind(hash) => {
                     Ok((boxed_array![ProofTree::Absent; LEN], Some(*hash)))
                 }
-                _ => Err(FromProofError::UnexpectedLeaf)?,
+                _ => Err(ProofError::UnexpectedLeaf)?,
             },
         }
     }
@@ -267,17 +278,30 @@ impl OwnedProofPart {
         }
     }
 
-    /// Map the inner [`MerkleProof`] if the proof is present.
-    ///
-    /// Panic: In debug mode, panic if the proof is absent.
-    pub(crate) fn map_present_unchecked(self, f: impl FnOnce(MerkleProof)) {
-        match self {
-            OwnedProofPart::Absent => debug_assert!(
-                false,
-                "If the node is present, then the branch is also present"
-            ),
-            OwnedProofPart::Present(proof) => f(proof),
+    /// Construct a node from its child proofs. The `parent` parameter allows us to restruct the
+    /// blinded state of the parent.
+    pub fn node_from_children(
+        parent: Partial<()>,
+        children: impl IntoIterator<Item = Self>,
+    ) -> Self {
+        match parent {
+            Partial::Absent => return OwnedProofPart::Absent,
+            Partial::Blinded(hash) => {
+                return OwnedProofPart::Present(MerkleProof::leaf_blind(hash));
+            }
+            Partial::Present(_) => {}
         }
+
+        let mut partial_children = Vec::with_capacity(MERKLE_ARITY);
+
+        for item in children {
+            match item {
+                OwnedProofPart::Absent => return OwnedProofPart::Absent,
+                OwnedProofPart::Present(tree) => partial_children.push(tree),
+            }
+        }
+
+        OwnedProofPart::Present(MerkleProof::Node(partial_children))
     }
 }
 
@@ -300,16 +324,13 @@ pub trait ProofLayout: Layout {
     ) -> Result<Hash, PartialHashError>;
 }
 
-impl<T: ProofLayout> ProofLayout for Box<T>
-where
-    AllocatedOf<T, Verifier>: 'static,
-{
+impl<T: ProofLayout> ProofLayout for Box<T> {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         T::to_merkle_tree(*state)
     }
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
-        Ok(T::into_verifier_alloc(proof)?.map(|(data, merkle)| (Box::new(data), merkle)))
+        Ok(T::into_verifier_alloc(proof)?.map(Box::new))
     }
 
     fn partial_state_hash(
@@ -322,7 +343,7 @@ where
 
 impl<T> ProofLayout for Atom<T>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    T: Encode + Decode<()> + 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         // The Merkle leaf must hold the serialisation of the initial state.
@@ -332,12 +353,12 @@ where
         let access_info = region.get_access_info();
         let cell = super::Cell::<T, Ref<'_, Owned>>::bind(region.inner_region_ref());
         let serialised = binary::serialise(&cell)?;
-        MerkleTree::make_merkle_leaf(serialised, access_info)
+        Ok(MerkleTree::make_merkle_leaf(serialised, access_info))
     }
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
         let f = Array::<T, 1>::into_verifier_alloc(proof)?;
-        Ok(f.map(|(data, merkle)| (super::Cell::from(data), merkle)))
+        Ok(f.map(super::Cell::from))
     }
 
     fn partial_state_hash(
@@ -346,7 +367,7 @@ where
     ) -> Result<Hash, PartialHashError> {
         let region = state.into_region();
         match region.get_partial_region() {
-            PartialState::Complete(region) => Ok(Hash::blake2b_hash(region)?),
+            PartialState::Complete(region) => Ok(Hash::blake3_hash(region)?),
             PartialState::Absent => proof.partial_hash_leaf(),
             PartialState::Incomplete => Err(PartialHashError::Fatal),
         }
@@ -355,7 +376,7 @@ where
 
 impl<T, const LEN: usize> ProofLayout for Array<T, LEN>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    T: Encode + Decode<()> + 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         // RV-282: Break down into multiple leaves if the size of the `Cells`
@@ -368,7 +389,7 @@ where
         let access_info = region.get_access_info();
         let cells = super::Cells::<T, LEN, Ref<'_, Owned>>::bind(region.inner_region_ref());
         let serialised = binary::serialise(&cells)?;
-        MerkleTree::make_merkle_leaf(serialised, access_info)
+        Ok(MerkleTree::make_merkle_leaf(serialised, access_info))
     }
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
@@ -376,8 +397,7 @@ where
 
         Ok(proof
             .into_leaf::<super::Cells<T, LEN, Owned>>()?
-            .map(|leaf| {
-                let (region, merkle) = leaf.split();
+            .map(|region| {
                 let region = match region {
                     Partial::Absent | Partial::Blinded(_) => verify_backend::Region::Absent,
                     Partial::Present(cells) => {
@@ -385,7 +405,7 @@ where
                         verify_backend::Region::Partial(arr)
                     }
                 };
-                (super::Cells::bind(region), merkle.into_leaf_proof_tree())
+                super::Cells::bind(region)
             }))
     }
 
@@ -395,27 +415,42 @@ where
     ) -> Result<Hash, PartialHashError> {
         let region = state.into_region();
         match region.get_partial_region() {
-            PartialState::Complete(region) => Ok(Hash::blake2b_hash(region)?),
+            PartialState::Complete(region) => Ok(Hash::blake3_hash(region)?),
             PartialState::Absent => proof.partial_hash_leaf(),
             PartialState::Incomplete => Err(PartialHashError::Fatal),
         }
     }
 }
 
-impl<const LEN: usize> ProofLayout for DynArray<LEN> {
+impl ProofLayout for DynArray {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
+        let len = state.len();
+
         let region = state.region_ref();
         let mut writer = MerkleWriter::new(
             MERKLE_LEAF_SIZE,
             MERKLE_ARITY,
             region.get_read(),
             region.get_write(),
-            LEN.div_ceil(MERKLE_ARITY),
+            len.div_ceil(MERKLE_ARITY),
         );
-        let read =
-            |address| -> [u8; MERKLE_LEAF_SIZE.get()] { region.inner_dyn_region_read(address) };
-        chunks_to_writer::<LEN, _, _>(&mut writer, read)?;
-        writer.finalise()
+        let read = |address| -> [u8; MERKLE_LEAF_SIZE.get()] {
+            // SAFETY: The chunk writer will only request data within the given bounds. The bounds
+            // are set to the length of the dynamic array.
+            unsafe { region.inner_dyn_region_read(address) }
+        };
+        chunks_to_writer::<_, _>(&mut writer, len, read)?;
+
+        let pages_node = writer.finalise()?;
+
+        let length_node = MerkleTree::make_merkle_leaf(
+            binary::serialise(len as u64)?,
+            region.need_length_in_proof(),
+        );
+
+        let root_node = MerkleTree::make_merkle_node(vec![length_node, pages_node]);
+
+        Ok(root_node)
     }
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
@@ -430,72 +465,161 @@ impl<const LEN: usize> ProofLayout for DynArray<LEN> {
             start: usize,
             left_length: usize,
             proof: D,
-        ) -> Result<D::Suspended<(Vec<PageData>, OwnedProofPart)>> {
+        ) -> Result<D::Suspended<Vec<PageData>>> {
             let page = verify_backend::PageId::from_address(start);
 
             if left_length <= MERKLE_LEAF_SIZE.get() {
                 let ctx = proof.into_leaf_raw()?;
                 let ctx = ctx.map(move |data| match data {
-                    Partial::Absent => (vec![], OwnedProofPart::Absent),
-                    Partial::Blinded(hash) => (
-                        vec![],
-                        OwnedProofPart::Present(MerkleProof::leaf_blind(hash)),
-                    ),
-                    Partial::Present(data) => (
-                        vec![(page, data.clone())],
-                        OwnedProofPart::Present(MerkleProof::leaf_read(data.to_vec())),
-                    ),
+                    Partial::Absent => vec![],
+                    Partial::Blinded(_hash) => vec![],
+                    Partial::Present(data) => vec![(page, data.clone())],
                 });
                 Ok(ctx)
             } else {
-                let ctx = proof
-                    .into_node()?
-                    .map(|node_partial| (vec![], node_partial.map_present(|()| vec![])));
-                let ctx = Ok::<_, FromProofError>(ctx);
-                let r = work_merkle_params::<MERKLE_ARITY>(start, left_length).fold(
-                    ctx,
-                    |ctx, (start, length)| {
-                        Ok(ctx?
-                            .next_branch(|proof| parse_pages_fn_getter(start, length, proof))?
-                            .map(|((mut acc, merkle_acc), (br_data, br_merkle))| {
-                                let merkle_acc = merkle_acc.map_present(|mut acc| {
-                                    br_merkle.map_present_unchecked(|br_proof| acc.push(br_proof));
-                                    acc
-                                });
-                                acc.extend(br_data);
-                                (acc, merkle_acc)
-                            }))
-                    },
-                );
+                let ctx = proof.into_node()?;
 
-                Ok(r?
-                    .map(|(acc, merkle_children)| {
-                        (acc, OwnedProofPart::node_from_partial(merkle_children))
-                    })
-                    .done()?)
+                let mut pages_acc = Vec::new();
+
+                let mut work_brackets = work_merkle_params::<MERKLE_ARITY>(start, left_length);
+                let ctx = work_brackets.try_fold(
+                    ctx,
+                    |ctx, (start, length)| -> Result<_, ProofError> {
+                        let (ctx, pages) =
+                            ctx.next_branch(|proof| parse_pages_fn_getter(start, length, proof))?;
+
+                        pages_acc.extend(pages);
+
+                        Ok(ctx)
+                    },
+                )?;
+
+                ctx.done(pages_acc)
             }
         }
 
-        let pages_handler = parse_pages_fn_getter::<D>(0, LEN, proof)?;
+        let proof = proof.into_node()?;
+        let (proof, length) = proof.next_branch(|proof| proof.into_leaf::<u64>())?;
 
-        // After the recursive parsing, convert all pages into cells.
-        Ok(pages_handler.map(|(pages, merkle)| {
-            let region = verify_backend::DynRegion::from_pages(pages);
-            (super::DynCells::bind(region), merkle)
-        }))
+        let (proof, pages) = proof.next_branch(|proof| {
+            let length = length.to_present().map(|len| len as usize);
+
+            let pages_handler = match length {
+                // When the length node is present, we can properly parse all pages.
+                Some(len) => parse_pages_fn_getter::<D>(0, len, proof)?,
+
+                // When the length node is not present, we cannot parse any pages. This needs to be
+                // validated. In other words, the node for the pages must be blinded or absent.
+                None => {
+                    // XXX: We can't pick whether this is a node or leaf given we don't know the
+                    // length. However, absent or blinded leaves are encoded the same way as nodes.
+                    // In the case where the node is present (which is an error in here), we would
+                    // trigger an unexpected leaf error instead of the more appropriate error below.
+                    let proof = proof.into_node()?;
+
+                    match proof.presence() {
+                        Partial::Absent | Partial::Blinded(_) => {
+                            // Fine, hence we extract no pages.
+                        }
+
+                        Partial::Present(_) => {
+                            // Not fine, there may be pages and we don't know how to extract them.
+                            return Err(ProofError::DependentNodeIsAbsent);
+                        }
+                    }
+
+                    proof.done(Vec::new())?
+                }
+            };
+
+            // After the recursive parsing, convert all pages into cells.
+            Ok(pages_handler.map(|pages| {
+                let region = verify_backend::DynRegion::from_pages(length, pages);
+                super::DynCells::bind(region)
+            }))
+        })?;
+
+        proof.done(pages)
     }
 
     fn partial_state_hash(
         state: RefVerifierAlloc<Self>,
         proof: ProofTree,
     ) -> Result<Hash, PartialHashError> {
+        let region = state.region_ref();
+
+        let proof = match proof {
+            ProofPart::Absent => {
+                if !region.is_completely_absent() {
+                    // The verifier contains data, but the proof is not in the right shape for us
+                    // to insert back the data and obtain a root hash. This indicates an invalid
+                    // proof.
+                    return Err(PartialHashError::Fatal);
+                }
+
+                // The dynamic region is untouched, so re-hashing needs to resume higher up in the
+                // proof tree.
+                return Err(PartialHashError::PotentiallyRecoverable);
+            }
+
+            ProofPart::Present(proof) => proof,
+        };
+
+        let children = match proof {
+            Tree::Leaf(MerkleProofLeaf::Blind(hash)) => {
+                if !region.is_completely_absent() {
+                    // The verifier contains data, but the proof is not in the right shape for us
+                    // to insert back the data and obtain a root hash. This indicates an invalid
+                    // proof.
+                    //
+                    // From a partial Merkle tree perspective, technically you can blind a node in
+                    // the proof and then write all the data necessary to expand the node fully
+                    // after the verification is done. In the context of a dynamic region that
+                    // would entail setting the length and writing all pages. However, dynamic
+                    // regions cannot be re-created hence you cannot "write" the length. Any
+                    // modification requires at least the length node to be present. Hence,
+                    // blinding the pages node can be paired with modifications, but you cannot
+                    // blind the dynamic region's root node if there are modifications.
+                    return Err(PartialHashError::Fatal);
+                }
+
+                // We already know that the dynamic region has been untouched at this point.
+                return Ok(*hash);
+            }
+
+            Tree::Leaf(MerkleProofLeaf::Read(_)) => {
+                return Err(PartialHashError::FromProof(ProofError::UnexpectedLeaf));
+            }
+
+            Tree::Node(children) => children.as_slice(),
+        };
+
+        let [length_tree, pages_tree] = children else {
+            return Err(PartialHashError::FromProof(
+                ProofError::BadNumberOfBranches {
+                    expected: 2,
+                    got: children.len(),
+                },
+            ));
+        };
+
+        let length = if let Tree::Leaf(MerkleProofLeaf::Read(data)) = length_tree {
+            // The length data must be present if the node is present. Practically, if there is any
+            // pages data to be dealt with we require the length. Or if there is no pages data,
+            // then the only reason the parent node would be present is if the length was to be
+            // read during verification.
+            binary::deserialise::<u64>(data).map_err(ProofError::Deserialise)? as usize
+        } else {
+            return Err(PartialHashError::Fatal);
+        };
+
         enum Event<'a> {
             Span(usize, usize, ProofTree<'a>),
             Node(Option<Hash>),
         }
 
         let mut queue = VecDeque::new();
-        queue.push_back(Event::Span(0usize, LEN, proof));
+        queue.push_back(Event::Span(0usize, length, ProofTree::Present(pages_tree)));
 
         let mut hashes: Vec<Result<Hash, PartialHashError>> = Vec::new();
 
@@ -512,7 +636,7 @@ impl<const LEN: usize> ProofLayout for DynArray<LEN> {
                         {
                             PartialState::Absent => hashes.push(tree.partial_hash_leaf()),
                             PartialState::Complete(data) => {
-                                hashes.push(Ok(Hash::blake2b_hash_bytes(data)?))
+                                hashes.push(Ok(Hash::blake3_hash_bytes(data)))
                             }
                             PartialState::Incomplete => {
                                 return Err(PartialHashError::Fatal);
@@ -557,11 +681,17 @@ impl<const LEN: usize> ProofLayout for DynArray<LEN> {
             }
         }
 
-        if hashes.len() == 1 {
-            hashes.pop().unwrap()
-        } else {
-            Err(PartialHashError::Fatal)
-        }
+        // There must only be a single hash, the root hash. If there are more or less, that is an
+        // error.
+        let pages_hash = hashes
+            .pop()
+            .filter(|_| hashes.is_empty())
+            .map_or(Err(PartialHashError::Fatal), |hash| hash)?;
+
+        let length_hash = Hash::blake3_hash(length as u64)?;
+        let root_hash = Hash::combine([length_hash, pages_hash]);
+
+        Ok(root_hash)
     }
 }
 
@@ -585,50 +715,23 @@ impl<const LEN: usize> ProofLayout for DynArray<LEN> {
 /// }
 /// ```
 macro_rules! tuple_branches_proof_layout {
-    (@no_done; $proof:expr, $($branches:path),+) => {
-        {
-            let ctx = $proof.into_node()?.map(|node_partial| ((), node_partial.map_present(|()| vec![])));
+    ($proof:expr, $($branches:ident),+) => {{
+        let ctx = $proof.into_node()?;
 
-            tuple_branches_proof_layout!(@internal; ctx, [], $($branches),+)
+        paste::paste! {
+            $(
+                let (ctx, [<$branches:lower>]) = ctx.next_branch(|child_proof| [<$branches>]::into_verifier_alloc(child_proof))?;
+            )+
+
+            let value = (
+                $(
+                    [<$branches:lower>]
+                ),+
+            );
         }
-    };
-    ($proof:expr, $($branches:path),+) => {
-        {
-            let ctx = tuple_branches_proof_layout!(@no_done; $proof, $($branches),+);
 
-            ctx.done()
-        }
-    };
-    (@internal; $de:expr, [$($acc_br:path),*], $curr_br:path $(, $rest_br:path)*) => {
-        {
-            use $crate::state_backend::proof_backend::proof::deserialiser::DeserialiserNode;
-            use tuples::CombinRight;
-
-            let de = $de.next_branch(|child_proof| <$curr_br>::into_verifier_alloc(child_proof))?
-                .map(|((acc, merkle_acc), (br, br_merkle))| {
-                    (
-                        acc.push_right(br),
-                        merkle_acc.map_present(|mut acc| {
-                            br_merkle.map_present_unchecked(|br_proof| {
-                                acc.push(br_proof);
-                            });
-                            acc
-                        }),
-                    )
-                });
-
-            tuple_branches_proof_layout!(@internal; de, [ $($acc_br,)* $curr_br ] $(, $rest_br)*)
-        }
-    };
-    (@internal; $de:expr, [$($acc_br:path),*]) => {
-        {
-            use $crate::state_backend::proof_layout::OwnedProofPart;
-
-            $de.map(|(acc, merkle_children)| {
-                (acc, OwnedProofPart::node_from_partial(merkle_children))
-            })
-        }
-    };
+        ctx.done(value)
+    }};
 }
 
 pub(crate) use tuple_branches_proof_layout;
@@ -637,12 +740,10 @@ impl<A, B> ProofLayout for (A, B)
 where
     A: ProofLayout,
     B: ProofLayout,
-    AllocatedOf<A, Verifier>: 'static,
-    AllocatedOf<B, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = vec![A::to_merkle_tree(state.0)?, B::to_merkle_tree(state.1)?];
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<De: Deserialiser>(proof: De) -> VerifierAllocResult<De, Self> {
@@ -669,9 +770,6 @@ where
     A: ProofLayout,
     B: ProofLayout,
     C: ProofLayout,
-    AllocatedOf<A, Verifier>: 'static,
-    AllocatedOf<B, Verifier>: 'static,
-    AllocatedOf<C, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = vec![
@@ -679,7 +777,7 @@ where
             B::to_merkle_tree(state.1)?,
             C::to_merkle_tree(state.2)?,
         ];
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<De: Deserialiser>(proof: De) -> VerifierAllocResult<De, Self> {
@@ -708,10 +806,6 @@ where
     B: ProofLayout,
     C: ProofLayout,
     D: ProofLayout,
-    AllocatedOf<A, Verifier>: 'static,
-    AllocatedOf<B, Verifier>: 'static,
-    AllocatedOf<C, Verifier>: 'static,
-    AllocatedOf<D, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = vec![
@@ -720,7 +814,7 @@ where
             C::to_merkle_tree(state.2)?,
             D::to_merkle_tree(state.3)?,
         ];
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<De: Deserialiser>(proof: De) -> VerifierAllocResult<De, Self> {
@@ -751,11 +845,6 @@ where
     C: ProofLayout,
     D: ProofLayout,
     E: ProofLayout,
-    AllocatedOf<A, Verifier>: 'static,
-    AllocatedOf<B, Verifier>: 'static,
-    AllocatedOf<C, Verifier>: 'static,
-    AllocatedOf<D, Verifier>: 'static,
-    AllocatedOf<E, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = vec![
@@ -765,7 +854,7 @@ where
             D::to_merkle_tree(state.3)?,
             E::to_merkle_tree(state.4)?,
         ];
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<De: Deserialiser>(proof: De) -> VerifierAllocResult<De, Self> {
@@ -797,12 +886,6 @@ where
     D: ProofLayout,
     E: ProofLayout,
     F: ProofLayout,
-    AllocatedOf<A, Verifier>: 'static,
-    AllocatedOf<B, Verifier>: 'static,
-    AllocatedOf<C, Verifier>: 'static,
-    AllocatedOf<D, Verifier>: 'static,
-    AllocatedOf<E, Verifier>: 'static,
-    AllocatedOf<F, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = vec![
@@ -813,7 +896,7 @@ where
             E::to_merkle_tree(state.4)?,
             F::to_merkle_tree(state.5)?,
         ];
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<De: Deserialiser>(proof: De) -> VerifierAllocResult<De, Self> {
@@ -841,8 +924,7 @@ where
 
 impl<T, const LEN: usize> ProofLayout for [T; LEN]
 where
-    T: ProofLayout + 'static,
-    AllocatedOf<T, Verifier>: 'static,
+    T: ProofLayout,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let children = state
@@ -850,43 +932,29 @@ where
             .map(T::to_merkle_tree)
             .collect::<Result<Vec<_>, _>>()?;
 
-        MerkleTree::make_merkle_node(children)
+        Ok(MerkleTree::make_merkle_node(children))
     }
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
-        let mut ctx = proof
-            .into_node()?
-            .map(|node_partial| (vec![], node_partial.map_present(|()| vec![])));
+        let ctx = proof.into_node()?;
 
-        for _ in 0..LEN {
-            ctx = ctx
-                .next_branch(|child_proof| T::into_verifier_alloc(child_proof))?
-                .map(|((mut acc, merkle_acc), (br_res, br_merkle))| {
-                    acc.push(br_res);
-                    (
-                        acc,
-                        merkle_acc.map_present(|mut acc| {
-                            br_merkle.map_present_unchecked(|br_proof| {
-                                acc.push(br_proof);
-                            });
-                            acc
-                        }),
-                    )
-                });
-        }
+        let mut children_acc = Vec::with_capacity(LEN);
 
-        let ctx = ctx.map(|(data, merkle_acc)| {
-            let data = data
-                .try_into()
-                .map_err(|_| {
-                    // We can't use expected because the error can't be displayed
-                    unreachable!("Conversion to array of fixed length doesn't fail")
-                })
-                .expect("Conversion to array of fixed length failed unexpectedly");
-            (data, OwnedProofPart::node_from_partial(merkle_acc))
-        });
+        let ctx = (0..LEN).try_fold(ctx, |ctx, _| -> Result<_, ProofError> {
+            let (ctx, child) =
+                ctx.next_branch(|child_proof| T::into_verifier_alloc(child_proof))?;
 
-        ctx.done()
+            children_acc.push(child);
+
+            Ok(ctx)
+        })?;
+
+        let Ok(children) = children_acc.try_into() else {
+            // We can't use expected because the error can't be displayed
+            unreachable!("Conversion to array of fixed length doesn't fail")
+        };
+
+        ctx.done(children)
     }
 
     fn partial_state_hash(
@@ -906,7 +974,6 @@ where
 impl<T, const LEN: usize> ProofLayout for Many<T, LEN>
 where
     T: ProofLayout,
-    AllocatedOf<T, Verifier>: 'static,
 {
     fn to_merkle_tree(state: RefProofGenOwnedAlloc<Self>) -> Result<MerkleTree, HashError> {
         let leaves = state
@@ -919,7 +986,7 @@ where
 
     fn into_verifier_alloc<D: Deserialiser>(proof: D) -> VerifierAllocResult<D, Self> {
         // Avoids clippy warnings about the type being too complex.
-        type NestedSuspendedResult<T> = (Vec<AllocatedOf<T, Verifier>>, OwnedProofPart);
+        type NestedSuspendedResult<T> = Vec<AllocatedOf<T, Verifier>>;
 
         // Obtain a deserialiser for a given length, i.e. Many<T, length>
         // We know that AllocatedOf<Many<T, LEN>, Verifier> = Vec<AllocatedOf<T, Verifier>>.
@@ -929,50 +996,29 @@ where
         fn parametrised_deserialiser<T: ProofLayout, D: Deserialiser>(
             length: usize,
             proof: D,
-        ) -> Result<D::Suspended<NestedSuspendedResult<T>>>
-        where
-            AllocatedOf<T, Verifier>: 'static,
-        {
-            let child_length_iter = work_merkle_params::<MERKLE_ARITY>(0, length);
-
+        ) -> Result<D::Suspended<NestedSuspendedResult<T>>> {
             if length == 1 {
-                Ok(T::into_verifier_alloc(proof)?.map(|(data, merkle)| (vec![data], merkle)))
+                Ok(T::into_verifier_alloc(proof)?.map(|data| vec![data]))
             } else {
-                let mut ctx = proof
-                    .into_node()?
-                    .map(|node_partial| (vec![], node_partial.map_present(|()| (vec![]))));
-                for (_, child_length) in child_length_iter {
-                    ctx = ctx
-                        .next_branch(|child_proof| {
+                let ctx = proof.into_node()?;
+
+                let mut children_acc = Vec::with_capacity(MERKLE_ARITY);
+
+                let mut child_length_iter = work_merkle_params::<MERKLE_ARITY>(0, length);
+                let ctx = child_length_iter.try_fold(
+                    ctx,
+                    |ctx, (_, child_length)| -> Result<_, ProofError> {
+                        let (ctx, children) = ctx.next_branch(|child_proof| {
                             parametrised_deserialiser::<T, D>(child_length, child_proof)
-                        })?
-                        .map(|((mut acc, merkle_acc), (br, merkle_br))| {
-                            acc.extend(br);
-                            let merkle_acc = merkle_acc.map_present(|mut acc| {
-                                match merkle_br {
-                                    OwnedProofPart::Absent => debug_assert!(
-                                        false,
-                                        "If the node is present, then the branch is also present"
-                                    ),
-                                    OwnedProofPart::Present(proof) => acc.push(proof),
-                                };
-                                acc
-                            });
-                            (acc, merkle_acc)
-                        });
-                }
-                let ctx = ctx.map(|(acc, merkle_children)| {
-                    (acc, match merkle_children {
-                        Partial::Absent => OwnedProofPart::Absent,
-                        Partial::Blinded(hash) => {
-                            OwnedProofPart::Present(MerkleProof::leaf_blind(hash))
-                        }
-                        Partial::Present(children) => {
-                            OwnedProofPart::Present(MerkleProof::Node(children))
-                        }
-                    })
-                });
-                ctx.done()
+                        })?;
+
+                        children_acc.extend(children);
+
+                        Ok(ctx)
+                    },
+                )?;
+
+                ctx.done(children_acc)
             }
         }
 
@@ -1057,11 +1103,12 @@ where
         // Check that we iterated over all the elements of the state
         debug_assert_eq!(next_vec_index, LEN);
 
-        if hashes.len() == 1 {
-            hashes.pop().unwrap()
-        } else {
-            Err(PartialHashError::Fatal)
-        }
+        // There must only be a single hash, the root hash. If there are more or less, that is an
+        // error.
+        hashes
+            .pop()
+            .filter(|_| hashes.is_empty())
+            .map_or(Err(PartialHashError::Fatal), |hash| hash)
     }
 }
 
@@ -1076,7 +1123,7 @@ pub fn combine_partial_hashes(
 ) -> Result<Hash, PartialHashError> {
     let hash_results = hash_results.as_ref();
     if hash_results.is_empty() {
-        return Ok(Hash::combine(&[])?);
+        return Ok(Hash::combine::<Hash, _>([]));
     }
 
     // If the first result is a hash, all results need to be a hash in order to
@@ -1101,7 +1148,7 @@ pub fn combine_partial_hashes(
 
     if expect_ok {
         debug_assert_eq!(hashes.len(), hash_results_len);
-        return Ok(Hash::combine(hashes.as_slice())?);
+        return Ok(Hash::combine(hashes));
     };
 
     proof_hash.ok_or(PartialHashError::PotentiallyRecoverable)
@@ -1148,10 +1195,13 @@ mod tests {
 
     use super::*;
     use crate::state_backend::Cells;
+    use crate::state_backend::CommitmentLayout;
+    use crate::state_backend::DynCells;
     use crate::state_backend::FnManagerIdent;
     use crate::state_backend::ManagerWrite;
     use crate::state_backend::proof_backend::ProofGen;
     use crate::state_backend::proof_backend::ProofRegion;
+    use crate::state_backend::proof_backend::ProofWrapper;
     use crate::state_backend::proof_backend::proof::deserialise_owned;
 
     const CELLS_SIZE: usize = 32;
@@ -1185,8 +1235,7 @@ mod tests {
 
             let merkle_proof = <TestLayout as ProofLayout>::to_merkle_tree(proof_state)
                 .unwrap()
-                .to_merkle_proof()
-                .unwrap();
+                .to_merkle_proof();
 
             let verifier_state = deserialise_owned::deserialise::<TestLayout>(
                 ProofTree::Present(&merkle_proof)
@@ -1210,5 +1259,186 @@ mod tests {
                 <TestLayout as ProofLayout>::partial_state_hash(ref_verifier_state, ProofTree::Present(&merkle_proof)).is_ok()
             );
         })
+    }
+
+    /// Test the proof generation and verification for a computation against a dynamic region.
+    ///
+    /// # Safety
+    ///
+    /// The `test_proof` and `test_verify` function must be the same function instantiated to
+    /// different managers.
+    ///
+    /// Due to Rust's limitation on higher-ranked polymorphism, we can't accept
+    /// a single function and instantiate it within the function body with the respective managers
+    /// `ProofGen<_>` and `Verifier`. One could work around this restriction by using a trait to
+    /// simulate the rank-2-ness, but that means you can't provide closures as the implementation
+    /// any more. If any of the given `test_proof` or `test_verify` capture an environment, this
+    /// would no longer work.
+    unsafe fn test_dyn_array_with_funs(
+        len: usize,
+        test_proof: impl FnOnce(&mut DynCells<ProofGen<Ref<'_, Owned>>>),
+        test_verify: impl FnOnce(&mut DynCells<Verifier>),
+    ) {
+        let owned_cell = DynCells::new(len);
+
+        // We require the initial hash to ensure that the generated proof, but also the
+        // instantiated state from the proof match the "before" state.
+        let init_hash = {
+            let state_ref = owned_cell.struct_ref::<FnManagerIdent>();
+            DynArray::state_hash(state_ref).unwrap()
+        };
+
+        // The `ProofWrapper` transformer ensures the resulting dynamic region (via `DynCells`) is
+        // setup for proof generation. You can think of this as starting the recording for a proof.
+        let mut proof_cell = owned_cell.struct_ref::<ProofWrapper>();
+
+        test_proof(&mut proof_cell);
+
+        // The post-hash is required to ensure that the verifier's final state matches the prover's
+        // final state.
+        let post_hash = DynArray::state_hash(proof_cell.struct_ref::<FnManagerIdent>()).unwrap();
+
+        let tree = DynArray::to_merkle_tree(proof_cell.struct_ref::<FnManagerIdent>()).unwrap();
+        let proof_tree = tree.to_merkle_proof();
+        assert_eq!(proof_tree.root_hash(), init_hash);
+
+        // Instantiating the verifier state allows us to replay the computation and verify it does
+        // the right things.
+        let (mut verify_cell, out_proof) =
+            deserialise_owned::deserialise::<DynArray>(ProofTree::Present(&proof_tree)).unwrap();
+
+        let OwnedProofPart::Present(out_proof) = out_proof else {
+            panic!("Expected present proof");
+        };
+        assert_eq!(proof_tree, out_proof);
+
+        let out_proof_tree = ProofTree::Present(&out_proof);
+
+        // The initial verifier state must match that of the initial state against which we
+        // produced the proof.
+        let verifier_init_hash = {
+            let state_ref = verify_cell.struct_ref::<FnManagerIdent>();
+            DynArray::partial_state_hash(state_ref, out_proof_tree).unwrap()
+        };
+        assert_eq!(verifier_init_hash, init_hash);
+
+        test_verify(&mut verify_cell);
+
+        // Once we're doing replaying the computation on the verifier side, the final state must
+        // match that of the prover's. If not, that means we produced a proof that results in a
+        // transition that we did not intend to prove.
+        let verifier_post_hash = {
+            let state_ref = verify_cell.struct_ref::<FnManagerIdent>();
+            DynArray::partial_state_hash(state_ref, out_proof_tree).unwrap()
+        };
+        assert_eq!(verifier_post_hash, post_hash);
+    }
+
+    /// Generate a test for dynamic regions using a given size and closure which operates on the
+    /// [`DynCells`]. This effectively demonstrates that the actions performed by the given closure
+    /// can be proven and verified correctly.
+    macro_rules! test_dyn_array_with {
+        ($len:literal, | $param:ident | { $($body:tt)* }) => {
+            {
+                let test_proof = |$param: &mut DynCells<ProofGen<Ref<'_, Owned>>>| {
+                    $($body)*
+                };
+
+                let test_verify = |$param: &mut DynCells<Verifier>| {
+                    $($body)*
+                };
+
+                // SAFETY: This function is intended to be used only in this macro.
+                unsafe {
+                    test_dyn_array_with_funs($len, test_proof, test_verify);
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_nothing() {
+        test_dyn_array_with!(65536, |_cell| {});
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_read() {
+        proptest!(|(addr in 0..65528usize)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    cell.read::<u64>(addr);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_write() {
+        proptest!(|(addr in 0..65528usize, val: u64)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    cell.write::<u64>(addr, val);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_len() {
+        test_dyn_array_with!(65536, |cell| {
+            cell.len();
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_read_and_len() {
+        proptest!(|(addr in 0..65528usize)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    cell.read::<u64>(addr);
+                }
+
+                cell.len();
+            });
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_write_and_len() {
+        proptest!(|(addr in 0..65528usize, val: u64)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    cell.write::<u64>(addr, val);
+                }
+
+                cell.len();
+            });
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_read_and_write() {
+        proptest!(|(addr in 0..65528usize, val: u64)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    let x = cell.read::<u64>(addr);
+                    cell.write(addr, x.wrapping_add(val));
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn test_dyn_array_proofs_read_and_write_and_len() {
+        proptest!(|(addr in 0..65528usize, val: u64)| {
+            test_dyn_array_with!(65536, |cell| {
+                unsafe {
+                    let x = cell.read::<u64>(addr);
+                    cell.write(addr, x.wrapping_add(val));
+                }
+
+                cell.len();
+            });
+        });
     }
 }

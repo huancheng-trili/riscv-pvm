@@ -2,22 +2,22 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! A replacement for [`InstrCacheable`] instructions.
+//! A replacement for [`Instr`] instructions.
 //!
 //! Rather than dispatching on a giant instruction enum, we instead split the instruction into
 //! two: an [`OpCode`] and an [`Args`].
 //!
 //! This allows us to dispatch the operation over the state directly from the opcode - both a
 //! simpler match statement and, ultimately, paves the way to pre-dispatch these functions
-//! when blocks are built in the block cache. This avoids the runtime overhead caused by
+//! when entrypoints are populated in the page cache. This avoids the runtime overhead caused by
 //! dispatching every time an instruction is run.
 
 mod constructors;
 
 use std::fmt::Debug;
 
-use serde::Deserialize;
-use serde::Serialize;
+use bincode::Decode;
+use bincode::Encode;
 
 use super::MachineCoreState;
 use super::ProgramCounterUpdate;
@@ -30,6 +30,7 @@ use super::registers::XRegister;
 use super::registers::nz;
 use super::registers::sp;
 use crate::default::ConstDefault;
+use crate::exceptions::Exception;
 use crate::instruction_context::ICB;
 use crate::instruction_context::IcbFnResult;
 use crate::instruction_context::IcbLoweringFn;
@@ -38,6 +39,7 @@ use crate::instruction_context::Predicate;
 use crate::instruction_context::Shift;
 use crate::interpreter::atomics;
 use crate::interpreter::branching;
+use crate::interpreter::csr;
 use crate::interpreter::float;
 use crate::interpreter::integer;
 use crate::interpreter::load_store;
@@ -63,7 +65,7 @@ use crate::parser::instruction::FRArgs;
 use crate::parser::instruction::FRegToXRegArgs;
 use crate::parser::instruction::FRegToXRegArgsWithRounding;
 use crate::parser::instruction::FStoreArgs;
-use crate::parser::instruction::InstrCacheable;
+use crate::parser::instruction::Instr;
 use crate::parser::instruction::InstrRoundingMode;
 use crate::parser::instruction::InstrWidth;
 use crate::parser::instruction::NonZeroRdRTypeArgs;
@@ -73,14 +75,13 @@ use crate::parser::instruction::UJTypeArgs;
 use crate::parser::instruction::XRegToFRegArgs;
 use crate::parser::instruction::XRegToFRegArgsWithRounding;
 use crate::state_backend::ManagerReadWrite;
-use crate::traps::Exception;
 
 /// An instruction formed of an opcode and flat arguments.
 ///
 /// This is preferred within the caches, as it enables 'pre-dispatch' of functions
 ///
-/// Instructions are constructable from [`InstrCacheable`] instructions.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+/// Instructions are constructable from [`Instr`] instructions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode, Decode)]
 pub struct Instruction {
     /// The operation (over the machine state) that this instruction represents.
     pub opcode: OpCode,
@@ -104,7 +105,7 @@ impl Instruction {
 
 impl ConstDefault for Instruction {
     const DEFAULT: Self = Instruction {
-        opcode: OpCode::Unknown,
+        opcode: OpCode::ForceFetchRun,
         args: Args::DEFAULT,
     };
 }
@@ -119,19 +120,19 @@ pub type RunInstr<MC, M> =
 
 /// Opcodes map to the operation performed over the state - allowing us to
 /// decouple these from the parsed instructions down the line.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Encode, Decode, PartialEq, Eq)]
 pub enum OpCode {
     Unknown,
 
     // RV64I R-type instructions
-    Add,
-    Sub,
+    X64Add,
+    X64Sub,
     X64Xor,
-    Or,
-    And,
-    ShiftLeft,
-    ShiftRightUnsigned,
-    ShiftRightSigned,
+    X64Or,
+    X64And,
+    X64ShiftLeft,
+    X64ShiftRightUnsigned,
+    X64ShiftRightSigned,
     SetLessThanSigned,
     SetLessThanUnsigned,
     AddWord,
@@ -146,9 +147,9 @@ pub enum OpCode {
     X64XorImm,
     X64OrImm,
     Andi,
-    ShiftLeftImmediate,
-    ShiftRightImmediateUnsigned,
-    ShiftRightImmediateSigned,
+    X64ShiftLeftImm,
+    X64ShiftRightImmUnsigned,
+    X64ShiftRightImmSigned,
     X32ShiftLeftImm,
     X32ShiftRightImmSigned,
     X32ShiftRightImmUnsigned,
@@ -333,9 +334,19 @@ pub enum OpCode {
     /// Jump to `pc + imm` if `val(rs2) > 0`.
     BranchGreaterThanZero,
 
-    /// Performs an environment call, from the current
-    /// machine mode.
+    /// Performs an environment call.
     ECall,
+
+    /// Raise a breakpoint exception.
+    EBreak,
+
+    /// Raise a fence.i exception.
+    FenceI,
+
+    /// Raise a [`ForceFetchRun`] exception.
+    ///
+    /// [`ForceFetchRun`]: Exception::ForceFetchRun
+    ForceFetchRun,
 }
 
 impl OpCode {
@@ -343,15 +354,15 @@ impl OpCode {
     #[inline(always)]
     pub(super) fn to_run<MC: MemoryConfig, M: ManagerReadWrite>(self) -> RunInstr<MC, M> {
         match self {
-            Self::Add => Args::run_add,
-            Self::Sub => Args::run_sub,
+            Self::X64Add => Args::run_x64_add,
+            Self::X64Sub => Args::run_x64_sub,
             Self::Neg => Args::run_neg,
             Self::X64Xor => Args::run_x64_xor,
-            Self::Or => Args::run_or,
-            Self::And => Args::run_and,
-            Self::ShiftLeft => Args::run_shift_left,
-            Self::ShiftRightUnsigned => Args::run_shift_right_unsigned,
-            Self::ShiftRightSigned => Args::run_shift_right_signed,
+            Self::X64Or => Args::run_x64_or,
+            Self::X64And => Args::run_x64_and,
+            Self::X64ShiftLeft => Args::run_x64_shift_left,
+            Self::X64ShiftRightUnsigned => Args::run_x64_shift_right_unsigned,
+            Self::X64ShiftRightSigned => Args::run_x64_shift_right_signed,
             Self::SetLessThanSigned => Args::run_set_less_than_signed,
             Self::SetLessThanUnsigned => Args::run_set_less_than_unsigned,
             Self::AddWord => Args::run_add_word,
@@ -364,9 +375,9 @@ impl OpCode {
             Self::X64XorImm => Args::run_x64_xor_immediate,
             Self::X64OrImm => Args::run_x64_or_immediate,
             Self::Andi => Args::run_andi,
-            Self::ShiftLeftImmediate => Args::run_shift_left_immediate,
-            Self::ShiftRightImmediateUnsigned => Args::run_shift_right_immediate_unsigned,
-            Self::ShiftRightImmediateSigned => Args::run_shift_right_immediate_signed,
+            Self::X64ShiftLeftImm => Args::run_x64_shift_left_imm,
+            Self::X64ShiftRightImmUnsigned => Args::run_x64_shift_right_imm_unsigned,
+            Self::X64ShiftRightImmSigned => Args::run_x64_shift_right_imm_signed,
             Self::X32ShiftLeftImm => Args::run_x32_shift_left_imm,
             Self::X32ShiftRightImmUnsigned => Args::run_x32_shift_right_imm_unsigned,
             Self::X32ShiftRightImmSigned => Args::run_x32_shift_right_imm_signed,
@@ -518,6 +529,9 @@ impl OpCode {
             Self::CFsdsp => Args::run_cfsdsp,
             Self::Unknown => Args::run_illegal,
             Self::ECall => Args::run_ecall,
+            Self::EBreak => Args::run_ebreak,
+            Self::FenceI => Args::run_fence_i,
+            Self::ForceFetchRun => Args::run_force_fetch_run,
         }
     }
 
@@ -535,13 +549,13 @@ impl OpCode {
             Self::Mv => Some(Args::run_mv),
             Self::Neg => Some(Args::run_neg),
             Self::Nop => Some(Args::run_nop),
-            Self::Add => Some(Args::run_add),
+            Self::X64Add => Some(Args::run_x64_add),
             Self::AddWord => Some(Args::run_add_word),
             Self::AddWordImmediate => Some(Args::run_add_word_immediate),
-            Self::Sub => Some(Args::run_sub),
+            Self::X64Sub => Some(Args::run_x64_sub),
             Self::SubWord => Some(Args::run_sub_word),
-            Self::And => Some(Args::run_and),
-            Self::Or => Some(Args::run_or),
+            Self::X64And => Some(Args::run_x64_and),
+            Self::X64Or => Some(Args::run_x64_or),
             Self::X64OrImm => Some(Args::run_x64_or_immediate),
             Self::X64Xor => Some(Args::run_x64_xor),
             Self::X64XorImm => Some(Args::run_x64_xor_immediate),
@@ -594,12 +608,12 @@ impl OpCode {
             Self::BranchGreaterThanOrEqualZero => Some(Args::run_branch_greater_than_or_equal_zero),
             Self::BranchGreaterThanZero => Some(Args::run_branch_greater_than_zero),
 
-            Self::ShiftLeft => Some(Args::run_shift_left),
-            Self::ShiftRightUnsigned => Some(Args::run_shift_right_unsigned),
-            Self::ShiftRightSigned => Some(Args::run_shift_right_signed),
-            Self::ShiftLeftImmediate => Some(Args::run_shift_left_immediate),
-            Self::ShiftRightImmediateUnsigned => Some(Args::run_shift_right_immediate_unsigned),
-            Self::ShiftRightImmediateSigned => Some(Args::run_shift_right_immediate_signed),
+            Self::X64ShiftLeft => Some(Args::run_x64_shift_left),
+            Self::X64ShiftRightUnsigned => Some(Args::run_x64_shift_right_unsigned),
+            Self::X64ShiftRightSigned => Some(Args::run_x64_shift_right_signed),
+            Self::X64ShiftLeftImm => Some(Args::run_x64_shift_left_imm),
+            Self::X64ShiftRightImmUnsigned => Some(Args::run_x64_shift_right_imm_unsigned),
+            Self::X64ShiftRightImmSigned => Some(Args::run_x64_shift_right_imm_signed),
             Self::X32ShiftLeft => Some(Args::run_x32_shift_left),
             Self::X32ShiftRightUnsigned => Some(Args::run_x32_shift_right_unsigned),
             Self::X32ShiftRightSigned => Some(Args::run_x32_shift_right_signed),
@@ -649,9 +663,22 @@ impl OpCode {
             // RV64F instructions
             Self::F64FromX64Unsigned => Some(Args::run_f64_from_x64_unsigned),
 
+            // RV64Zicsr instructions
+            Self::Csrrw => Some(Args::run_csrrw),
+            Self::Csrrs => Some(Args::run_csrrs),
+            Self::Csrrc => Some(Args::run_csrrc),
+            Self::Csrrwi => Some(Args::run_csrrwi),
+            Self::Csrrsi => Some(Args::run_csrrsi),
+            Self::Csrrci => Some(Args::run_csrrci),
+
             // Errors
             Self::Unknown => Some(Args::run_illegal),
             Self::ECall => Some(Args::run_ecall),
+            Self::EBreak => Some(Args::run_ebreak),
+
+            // Instruction/Data synchronisation guards
+            Self::ForceFetchRun => Some(Args::run_force_fetch_run),
+
             _ => None,
         }
     }
@@ -668,7 +695,7 @@ impl Instruction {
 }
 
 /// A struct containing X and F registers, along with a non-zero X register variant.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode, Decode)]
 pub struct Register {
     pub x: XRegister,
     pub f: FRegister,
@@ -707,7 +734,7 @@ impl From<NonZeroXRegister> for Register {
 /// Contains all possible arguments used by opcode-functions.
 ///
 /// Each opcode will only touch a subset of these.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode, Decode)]
 pub struct Args {
     pub rd: Register,
     pub rs1: Register,
@@ -788,7 +815,7 @@ macro_rules! impl_r_type {
 
     ($fn: ident, $shift: ident) => {
         fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
-            integer::run_shift(icb, Shift::$shift, self.rs1.nzx, self.rs2.nzx, self.rd.nzx);
+            integer::run_x64_shift(icb, Shift::$shift, self.rs1.nzx, self.rs2.nzx, self.rd.nzx);
             icb.ok(Next(self.width))
         }
     };
@@ -809,7 +836,7 @@ macro_rules! impl_x32_shift_type {
         fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
             let rs1 = self.rs1.nzx;
             let rd = self.rd.nzx;
-            integer::run_x32_shift_immediate(icb, Shift::$shift, rs1, self.imm, rd);
+            integer::run_x32_shift_imm(icb, Shift::$shift, rs1, self.imm, rd);
             icb.ok(Next(self.width))
         }
     };
@@ -869,7 +896,7 @@ macro_rules! impl_i_type {
 
     ($fn: ident, $shift: path) => {
         fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
-            integer::run_shift_immediate(icb, $shift, self.imm, self.rs1.nzx, self.rd.nzx);
+            integer::run_x64_shift_imm(icb, $shift, self.imm, self.rs1.nzx, self.rd.nzx);
             icb.ok(Next(self.width))
         }
     };
@@ -1038,27 +1065,19 @@ macro_rules! impl_fcss_type {
 }
 
 macro_rules! impl_csr_type {
-    ($fn: ident) => {
-        fn $fn<MC: MemoryConfig, M: ManagerReadWrite>(
-            &self,
-            core: &mut MachineCoreState<MC, M>,
-        ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.csr, self.rs1.x, self.rd.x)
-                .map(|_| Next(self.width))
+    ($impl: path, $fn: ident) => {
+        fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
+            let res = $impl(icb, self.csr, self.rs1.x, self.rd.x);
+            I::map(res, |()| Next(self.width))
         }
     };
 }
 
 macro_rules! impl_csr_imm_type {
-    ($fn: ident) => {
-        fn $fn<MC: MemoryConfig, M: ManagerReadWrite>(
-            &self,
-            core: &mut MachineCoreState<MC, M>,
-        ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.csr, self.imm as u64, self.rd.x)
-                .map(|_| Next(self.width))
+    ($impl: path, $fn: ident) => {
+        fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
+            let res = $impl(icb, self.csr, self.imm as u64, self.rd.x);
+            I::map(res, |()| Next(self.width))
         }
     };
 }
@@ -1069,9 +1088,8 @@ macro_rules! impl_f_x_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.x, self.rd.f)
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.x, self.rd.f);
+            Ok(Next(self.width))
         }
     };
 
@@ -1080,16 +1098,15 @@ macro_rules! impl_f_x_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.x, self.rm, self.rd.f)
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.x, self.rm, self.rd.f);
+            Ok(Next(self.width))
         }
     };
 
     ($impl: path, $fn: ident) => {
         fn $fn<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
-            let res = $impl(icb, self.rs1.x, self.rm, self.rd.f);
-            I::map(res, |_| Next(self.width))
+            $impl(icb, self.rs1.x, self.rm, self.rd.f);
+            icb.ok(Next(self.width))
         }
     };
 }
@@ -1100,9 +1117,8 @@ macro_rules! impl_x_f_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f, self.rd.x)
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rd.x);
+            Ok(Next(self.width))
         }
     };
 
@@ -1111,9 +1127,8 @@ macro_rules! impl_x_f_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f, self.rm, self.rd.x)
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rm, self.rd.x);
+            Ok(Next(self.width))
         }
     };
 }
@@ -1124,9 +1139,8 @@ macro_rules! impl_f_r_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f , self.rs2.f , self.rd.f )
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rs2.f, self.rd.f);
+            Ok(Next(self.width))
         }
     };
 
@@ -1135,9 +1149,8 @@ macro_rules! impl_f_r_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f , self.rs2.f , self.rd.x )
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rs2.f, self.rd.x);
+            Ok(Next(self.width))
         }
     };
 
@@ -1146,9 +1159,8 @@ macro_rules! impl_f_r_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f , self.rm, self.rd.f )
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rm, self.rd.f);
+            Ok(Next(self.width))
         }
     };
 
@@ -1157,23 +1169,22 @@ macro_rules! impl_f_r_type {
             &self,
             core: &mut MachineCoreState<MC, M>,
         ) -> Result<ProgramCounterUpdate<Address>, Exception> {
-            core.hart
-                .$fn(self.rs1.f , self.rs2.f , $(self.$field,)* self.rd.f )
-                .map(|_| Next(self.width))
+            core.hart.$fn(self.rs1.f, self.rs2.f, $(self.$field,)* self.rd.f);
+            Ok(Next(self.width))
         }
     };
 }
 
 impl Args {
     // RV64I R-type instructions
-    impl_r_type!(integer::run_add, run_add, non_zero);
-    impl_r_type!(integer::run_sub, run_sub, non_zero);
+    impl_r_type!(integer::run_x64_add, run_x64_add, non_zero);
+    impl_r_type!(integer::run_x64_sub, run_x64_sub, non_zero);
     impl_r_type!(integer::run_x64_xor, run_x64_xor, non_zero);
-    impl_r_type!(integer::run_and, run_and, non_zero);
-    impl_r_type!(integer::run_or, run_or, non_zero);
-    impl_r_type!(run_shift_left, Left);
-    impl_r_type!(run_shift_right_unsigned, RightUnsigned);
-    impl_r_type!(run_shift_right_signed, RightSigned);
+    impl_r_type!(integer::run_x64_and, run_x64_and, non_zero);
+    impl_r_type!(integer::run_x64_or, run_x64_or, non_zero);
+    impl_r_type!(run_x64_shift_left, Left);
+    impl_r_type!(run_x64_shift_right_unsigned, RightUnsigned);
+    impl_r_type!(run_x64_shift_right_signed, RightSigned);
     impl_r_type!(
         integer::run_set_less_than_signed,
         run_set_less_than_signed,
@@ -1208,9 +1219,9 @@ impl Args {
         non_zero
     );
     impl_i_type!(integer::run_andi, run_andi, non_zero);
-    impl_i_type!(run_shift_left_immediate, Shift::Left);
-    impl_i_type!(run_shift_right_immediate_unsigned, Shift::RightUnsigned);
-    impl_i_type!(run_shift_right_immediate_signed, Shift::RightSigned);
+    impl_i_type!(run_x64_shift_left_imm, Shift::Left);
+    impl_i_type!(run_x64_shift_right_imm_unsigned, Shift::RightUnsigned);
+    impl_i_type!(run_x64_shift_right_imm_signed, Shift::RightSigned);
     impl_x32_shift_type!(Left, run_x32_shift_left_imm, imm);
     impl_x32_shift_type!(RightUnsigned, run_x32_shift_right_imm_unsigned, imm);
     impl_x32_shift_type!(RightSigned, run_x32_shift_right_imm_signed, imm);
@@ -1416,12 +1427,12 @@ impl Args {
     impl_f_x_type!(run_fmv_d_x);
 
     // Zicsr instructions
-    impl_csr_type!(run_csrrw);
-    impl_csr_type!(run_csrrs);
-    impl_csr_type!(run_csrrc);
-    impl_csr_imm_type!(run_csrrwi);
-    impl_csr_imm_type!(run_csrrsi);
-    impl_csr_imm_type!(run_csrrci);
+    impl_csr_type!(csr::run_csrrw, run_csrrw);
+    impl_csr_type!(csr::run_csrrs, run_csrrs);
+    impl_csr_type!(csr::run_csrrc, run_csrrc);
+    impl_csr_imm_type!(csr::run_csrrwi, run_csrrwi);
+    impl_csr_imm_type!(csr::run_csrrsi, run_csrrsi);
+    impl_csr_imm_type!(csr::run_csrrci, run_csrrci);
 
     // RV32C compressed instructions
     impl_cr_nz_type!(integer::run_mv, run_mv);
@@ -1494,7 +1505,11 @@ impl Args {
     }
 
     fn run_ecall<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
-        icb.ecall()
+        icb.raise_exception(Exception::EnvCall)
+    }
+
+    fn run_ebreak<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
+        icb.raise_exception(Exception::Breakpoint)
     }
 
     // RV64C compressed instructions
@@ -1505,47 +1520,53 @@ impl Args {
 
     // Unknown
     fn run_illegal<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
-        icb.err_illegal_instruction()
+        icb.raise_exception(Exception::IllegalInstruction)
+    }
+
+    fn run_fence_i<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
+        icb.raise_exception(Exception::FenceI)
+    }
+
+    fn run_force_fetch_run<I: ICB>(&self, icb: &mut I) -> IcbFnResult<I> {
+        icb.raise_exception(Exception::ForceFetchRun)
     }
 }
 
-impl From<&InstrCacheable> for Instruction {
-    fn from(value: &InstrCacheable) -> Self {
+impl From<&Instr> for Instruction {
+    fn from(value: &Instr) -> Self {
         match value {
             // RV64I R-type instructions
-            InstrCacheable::Add(args) => Instruction::from_ic_add(args),
-            InstrCacheable::Sub(args) => Instruction::from_ic_sub(args),
-            InstrCacheable::Xor(args) => Instruction::from_ic_xor(args),
-            InstrCacheable::Or(args) => Instruction::from_ic_or(args),
-            InstrCacheable::And(args) => Instruction::from_ic_and(args),
-            InstrCacheable::Sll(args) => Instruction::from_ic_sll(args),
-            InstrCacheable::Srl(args) => Instruction::from_ic_srl(args),
-            InstrCacheable::Sra(args) => Instruction::from_ic_sra(args),
-            InstrCacheable::Slt(args) => {
-                Instruction::new_set_less_than_signed(args.rd, args.rs1, args.rs2)
-            }
-            InstrCacheable::Sltu(args) => {
+            Instr::Add(args) => Instruction::from_add(args),
+            Instr::Sub(args) => Instruction::from_sub(args),
+            Instr::Xor(args) => Instruction::from_xor(args),
+            Instr::Or(args) => Instruction::from_or(args),
+            Instr::And(args) => Instruction::from_and(args),
+            Instr::Sll(args) => Instruction::from_sll(args),
+            Instr::Srl(args) => Instruction::from_srl(args),
+            Instr::Sra(args) => Instruction::from_sra(args),
+            Instr::Slt(args) => Instruction::new_set_less_than_signed(args.rd, args.rs1, args.rs2),
+            Instr::Sltu(args) => {
                 Instruction::new_set_less_than_unsigned(args.rd, args.rs1, args.rs2)
             }
-            InstrCacheable::Addw(args) => {
+            Instr::Addw(args) => {
                 Instruction::new_add_word(args.rd, args.rs1, args.rs2, InstrWidth::Uncompressed)
             }
-            InstrCacheable::Subw(args) => {
+            Instr::Subw(args) => {
                 Instruction::new_sub_word(args.rd, args.rs1, args.rs2, InstrWidth::Uncompressed)
             }
-            InstrCacheable::Sllw(args) => Instruction::new_x32_shift_left(
+            Instr::Sllw(args) => Instruction::new_x32_shift_left(
                 args.rd,
                 args.rs1,
                 args.rs2,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Srlw(args) => Instruction::new_x32_shift_right_unsigned(
+            Instr::Srlw(args) => Instruction::new_x32_shift_right_unsigned(
                 args.rd,
                 args.rs1,
                 args.rs2,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Sraw(args) => Instruction::new_x32_shift_right_signed(
+            Instr::Sraw(args) => Instruction::new_x32_shift_right_signed(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1553,125 +1574,111 @@ impl From<&InstrCacheable> for Instruction {
             ),
 
             // RV64I I-type instructions
-            InstrCacheable::Addi(args) => Instruction::from_ic_addi(args),
-            InstrCacheable::Addiw(args) => Instruction::new_add_word_immediate(
+            Instr::Addi(args) => Instruction::from_addi(args),
+            Instr::Addiw(args) => Instruction::new_add_word_immediate(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Xori(args) => Instruction::from_ic_xori(args),
-            InstrCacheable::Ori(args) => Instruction::from_ic_ori(args),
-            InstrCacheable::Andi(args) => Instruction::from_ic_andi(args),
-            InstrCacheable::Slli(args) => Instruction::from_ic_slli(args),
-            InstrCacheable::Srli(args) => Instruction::from_ic_srli(args),
-            InstrCacheable::Srai(args) => Instruction::from_ic_srai(args),
-            InstrCacheable::Slliw(args) => Instruction::from_ic_x32_shift_left_immediate(args),
-            InstrCacheable::Srliw(args) => {
-                Instruction::from_ic_x32_shift_right_immediate_unsigned(args)
-            }
-            InstrCacheable::Sraiw(args) => {
-                Instruction::from_ic_x32_shift_right_immediate_signed(args)
-            }
-            InstrCacheable::Slti(args) => {
+            Instr::Xori(args) => Instruction::from_xori(args),
+            Instr::Ori(args) => Instruction::from_ori(args),
+            Instr::Andi(args) => Instruction::from_andi(args),
+            Instr::Slli(args) => Instruction::from_slli(args),
+            Instr::Srli(args) => Instruction::from_srli(args),
+            Instr::Srai(args) => Instruction::from_srai(args),
+            Instr::Slliw(args) => Instruction::from_x32_shift_left_immediate(args),
+            Instr::Srliw(args) => Instruction::from_x32_shift_right_immediate_unsigned(args),
+            Instr::Sraiw(args) => Instruction::from_x32_shift_right_immediate_signed(args),
+            Instr::Slti(args) => {
                 Instruction::new_set_less_than_immediate_signed(args.rd, args.rs1, args.imm)
             }
-            InstrCacheable::Sltiu(args) => {
+            Instr::Sltiu(args) => {
                 Instruction::new_set_less_than_immediate_unsigned(args.rd, args.rs1, args.imm)
             }
-            InstrCacheable::Lb(args) => Instruction::new_x8_load_signed(
+            Instr::Lb(args) => Instruction::new_x8_load_signed(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lh(args) => Instruction::new_x16_load_signed(
+            Instr::Lh(args) => Instruction::new_x16_load_signed(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lw(args) => Instruction::new_x32_load_signed(
+            Instr::Lw(args) => Instruction::new_x32_load_signed(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lbu(args) => Instruction::new_x8_load_unsigned(
+            Instr::Lbu(args) => Instruction::new_x8_load_unsigned(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lhu(args) => Instruction::new_x16_load_unsigned(
+            Instr::Lhu(args) => Instruction::new_x16_load_unsigned(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lwu(args) => Instruction::new_x32_load_unsigned(
+            Instr::Lwu(args) => Instruction::new_x32_load_unsigned(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Ld(args) => Instruction::new_x64_load_signed(
+            Instr::Ld(args) => Instruction::new_x64_load_signed(
                 args.rd,
                 args.rs1,
                 args.imm,
                 InstrWidth::Uncompressed,
             ),
             // RV64I S-type instructions
-            InstrCacheable::Sb(args) => {
+            Instr::Sb(args) => {
                 Instruction::new_x8_store(args.rs1, args.rs2, args.imm, InstrWidth::Uncompressed)
             }
-            InstrCacheable::Sh(args) => {
+            Instr::Sh(args) => {
                 Instruction::new_x16_store(args.rs1, args.rs2, args.imm, InstrWidth::Uncompressed)
             }
-            InstrCacheable::Sw(args) => {
+            Instr::Sw(args) => {
                 Instruction::new_x32_store(args.rs1, args.rs2, args.imm, InstrWidth::Uncompressed)
             }
-            InstrCacheable::Sd(args) => {
+            Instr::Sd(args) => {
                 Instruction::new_x64_store(args.rs1, args.rs2, args.imm, InstrWidth::Uncompressed)
             }
 
             // RV64I B-type instructions
-            InstrCacheable::Beq(args) => Instruction::from_ic_beq(args),
-            InstrCacheable::Bne(args) => Instruction::from_ic_bne(args),
-            InstrCacheable::Blt(args) => Instruction::from_ic_blt(args),
-            InstrCacheable::Bge(args) => Instruction::from_ic_bge(args),
-            InstrCacheable::Bltu(args) => Instruction::from_ic_bltu(args),
-            InstrCacheable::Bgeu(args) => Instruction::from_ic_bgeu(args),
+            Instr::Beq(args) => Instruction::from_beq(args),
+            Instr::Bne(args) => Instruction::from_bne(args),
+            Instr::Blt(args) => Instruction::from_blt(args),
+            Instr::Bge(args) => Instruction::from_bge(args),
+            Instr::Bltu(args) => Instruction::from_bltu(args),
+            Instr::Bgeu(args) => Instruction::from_bgeu(args),
 
             // RV64I U-type instructions
-            InstrCacheable::Lui(args) => {
-                Instruction::new_li(args.rd, args.imm, InstrWidth::Uncompressed)
-            }
-            InstrCacheable::Auipc(args) => {
+            Instr::Lui(args) => Instruction::new_li(args.rd, args.imm, InstrWidth::Uncompressed),
+            Instr::Auipc(args) => {
                 Instruction::new_add_immediate_to_pc(args.rd, args.imm, InstrWidth::Uncompressed)
             }
 
             // RV64I jump instructions
-            InstrCacheable::Jal(args) => Instruction::from_ic_jal(args),
-            InstrCacheable::Jalr(args) => Instruction::from_ic_jalr(args),
+            Instr::Jal(args) => Instruction::from_jal(args),
+            Instr::Jalr(args) => Instruction::from_jalr(args),
 
             // RV64A atomic instructions
-            InstrCacheable::Lrw(args) => Instruction::new_x32_atomic_load(
+            Instr::Lrw(args) => Instruction::new_x32_atomic_load(
                 args.rd,
                 args.rs1,
                 args.aq,
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Scw(args) => Instruction::new_x32_atomic_store(
-                args.rd,
-                args.rs1,
-                args.rs2,
-                args.aq,
-                args.rl,
-                InstrWidth::Uncompressed,
-            ),
-            InstrCacheable::Amoswapw(args) => Instruction::new_x32_atomic_swap(
+            Instr::Scw(args) => Instruction::new_x32_atomic_store(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1679,7 +1686,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoaddw(args) => Instruction::new_x32_atomic_add(
+            Instr::Amoswapw(args) => Instruction::new_x32_atomic_swap(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1687,7 +1694,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoxorw(args) => Instruction::new_x32_atomic_xor(
+            Instr::Amoaddw(args) => Instruction::new_x32_atomic_add(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1695,7 +1702,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoandw(args) => Instruction::new_x32_atomic_and(
+            Instr::Amoxorw(args) => Instruction::new_x32_atomic_xor(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1703,7 +1710,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoorw(args) => Instruction::new_x32_atomic_or(
+            Instr::Amoandw(args) => Instruction::new_x32_atomic_and(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1711,7 +1718,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amominw(args) => Instruction::new_x32_atomic_min_signed(
+            Instr::Amoorw(args) => Instruction::new_x32_atomic_or(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1719,7 +1726,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amomaxw(args) => Instruction::new_x32_atomic_max_signed(
+            Instr::Amominw(args) => Instruction::new_x32_atomic_min_signed(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1727,7 +1734,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amominuw(args) => Instruction::new_x32_atomic_min_unsigned(
+            Instr::Amomaxw(args) => Instruction::new_x32_atomic_max_signed(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1735,7 +1742,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amomaxuw(args) => Instruction::new_x32_atomic_max_unsigned(
+            Instr::Amominuw(args) => Instruction::new_x32_atomic_min_unsigned(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1743,14 +1750,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Lrd(args) => Instruction::new_x64_atomic_load(
-                args.rd,
-                args.rs1,
-                args.aq,
-                args.rl,
-                InstrWidth::Uncompressed,
-            ),
-            InstrCacheable::Scd(args) => Instruction::new_x64_atomic_store(
+            Instr::Amomaxuw(args) => Instruction::new_x32_atomic_max_unsigned(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1758,7 +1758,14 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoswapd(args) => Instruction::new_x64_atomic_swap(
+            Instr::Lrd(args) => Instruction::new_x64_atomic_load(
+                args.rd,
+                args.rs1,
+                args.aq,
+                args.rl,
+                InstrWidth::Uncompressed,
+            ),
+            Instr::Scd(args) => Instruction::new_x64_atomic_store(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1766,7 +1773,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoaddd(args) => Instruction::new_x64_atomic_add(
+            Instr::Amoswapd(args) => Instruction::new_x64_atomic_swap(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1774,7 +1781,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoxord(args) => Instruction::new_x64_atomic_xor(
+            Instr::Amoaddd(args) => Instruction::new_x64_atomic_add(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1782,7 +1789,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoandd(args) => Instruction::new_x64_atomic_and(
+            Instr::Amoxord(args) => Instruction::new_x64_atomic_xor(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1790,7 +1797,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amoord(args) => Instruction::new_x64_atomic_or(
+            Instr::Amoandd(args) => Instruction::new_x64_atomic_and(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1798,7 +1805,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amomind(args) => Instruction::new_x64_atomic_min_signed(
+            Instr::Amoord(args) => Instruction::new_x64_atomic_or(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1806,7 +1813,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amomaxd(args) => Instruction::new_x64_atomic_max_signed(
+            Instr::Amomind(args) => Instruction::new_x64_atomic_min_signed(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1814,7 +1821,7 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amominud(args) => Instruction::new_x64_atomic_min_unsigned(
+            Instr::Amomaxd(args) => Instruction::new_x64_atomic_max_signed(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1822,7 +1829,15 @@ impl From<&InstrCacheable> for Instruction {
                 args.rl,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Amomaxud(args) => Instruction::new_x64_atomic_max_unsigned(
+            Instr::Amominud(args) => Instruction::new_x64_atomic_min_unsigned(
+                args.rd,
+                args.rs1,
+                args.rs2,
+                args.aq,
+                args.rl,
+                InstrWidth::Uncompressed,
+            ),
+            Instr::Amomaxud(args) => Instruction::new_x64_atomic_max_unsigned(
                 args.rd,
                 args.rs1,
                 args.rs2,
@@ -1832,302 +1847,302 @@ impl From<&InstrCacheable> for Instruction {
             ),
 
             // RV64M multiplication and division instructions
-            InstrCacheable::Rem(args) => Instruction::from_ic_rem(args),
-            InstrCacheable::Remu(args) => Instruction::from_ic_remu(args),
-            InstrCacheable::Remw(args) => Instruction::from_ic_remw(args),
-            InstrCacheable::Remuw(args) => Instruction::from_ic_remuw(args),
-            InstrCacheable::Div(args) => Instruction::from_ic_div(args),
-            InstrCacheable::Divu(args) => Instruction::from_ic_divu(args),
-            InstrCacheable::Divw(args) => Instruction::from_ic_divw(args),
-            InstrCacheable::Divuw(args) => Instruction::from_ic_divuw(args),
-            InstrCacheable::Mul(args) => Instruction::from_ic_mul(args),
-            InstrCacheable::Mulh(args) => Instruction::from_ic_mulh(args),
-            InstrCacheable::Mulhsu(args) => Instruction::from_ic_mulhsu(args),
-            InstrCacheable::Mulhu(args) => Instruction::from_ic_mulhu(args),
-            InstrCacheable::Mulw(args) => Instruction::from_ic_mulw(args),
+            Instr::Rem(args) => Instruction::from_rem(args),
+            Instr::Remu(args) => Instruction::from_remu(args),
+            Instr::Remw(args) => Instruction::from_remw(args),
+            Instr::Remuw(args) => Instruction::from_remuw(args),
+            Instr::Div(args) => Instruction::from_div(args),
+            Instr::Divu(args) => Instruction::from_divu(args),
+            Instr::Divw(args) => Instruction::from_divw(args),
+            Instr::Divuw(args) => Instruction::from_divuw(args),
+            Instr::Mul(args) => Instruction::from_mul(args),
+            Instr::Mulh(args) => Instruction::from_mulh(args),
+            Instr::Mulhsu(args) => Instruction::from_mulhsu(args),
+            Instr::Mulhu(args) => Instruction::from_mulhu(args),
+            Instr::Mulw(args) => Instruction::from_mulw(args),
 
             // RV64F instructions
-            InstrCacheable::Flw(args) => Instruction {
+            Instr::Flw(args) => Instruction {
                 opcode: OpCode::Flw,
                 args: args.to_args(InstrWidth::Uncompressed),
             },
-            InstrCacheable::Fsw(args) => Instruction {
+            Instr::Fsw(args) => Instruction {
                 opcode: OpCode::Fsw,
                 args: args.to_args(InstrWidth::Uncompressed),
             },
-            InstrCacheable::Feqs(args) => Instruction {
+            Instr::Feqs(args) => Instruction {
                 opcode: OpCode::Feqs,
                 args: args.into(),
             },
-            InstrCacheable::Fles(args) => Instruction {
+            Instr::Fles(args) => Instruction {
                 opcode: OpCode::Fles,
                 args: args.into(),
             },
-            InstrCacheable::Flts(args) => Instruction {
+            Instr::Flts(args) => Instruction {
                 opcode: OpCode::Flts,
                 args: args.into(),
             },
-            InstrCacheable::Fadds(args) => Instruction {
+            Instr::Fadds(args) => Instruction {
                 opcode: OpCode::Fadds,
                 args: args.into(),
             },
-            InstrCacheable::Fsubs(args) => Instruction {
+            Instr::Fsubs(args) => Instruction {
                 opcode: OpCode::Fsubs,
                 args: args.into(),
             },
-            InstrCacheable::Fmuls(args) => Instruction {
+            Instr::Fmuls(args) => Instruction {
                 opcode: OpCode::Fmuls,
                 args: args.into(),
             },
-            InstrCacheable::Fdivs(args) => Instruction {
+            Instr::Fdivs(args) => Instruction {
                 opcode: OpCode::Fdivs,
                 args: args.into(),
             },
-            InstrCacheable::Fsqrts(args) => Instruction {
+            Instr::Fsqrts(args) => Instruction {
                 opcode: OpCode::Fsqrts,
                 args: args.into(),
             },
-            InstrCacheable::Fmins(args) => Instruction {
+            Instr::Fmins(args) => Instruction {
                 opcode: OpCode::Fmins,
                 args: args.into(),
             },
-            InstrCacheable::Fmaxs(args) => Instruction {
+            Instr::Fmaxs(args) => Instruction {
                 opcode: OpCode::Fmaxs,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjs(args) => Instruction {
+            Instr::Fsgnjs(args) => Instruction {
                 opcode: OpCode::Fsgnjs,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjns(args) => Instruction {
+            Instr::Fsgnjns(args) => Instruction {
                 opcode: OpCode::Fsgnjns,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjxs(args) => Instruction {
+            Instr::Fsgnjxs(args) => Instruction {
                 opcode: OpCode::Fsgnjxs,
                 args: args.into(),
             },
-            InstrCacheable::Fmadds(args) => Instruction {
+            Instr::Fmadds(args) => Instruction {
                 opcode: OpCode::Fmadds,
                 args: args.into(),
             },
-            InstrCacheable::Fmsubs(args) => Instruction {
+            Instr::Fmsubs(args) => Instruction {
                 opcode: OpCode::Fmsubs,
                 args: args.into(),
             },
-            InstrCacheable::Fnmsubs(args) => Instruction {
+            Instr::Fnmsubs(args) => Instruction {
                 opcode: OpCode::Fnmsubs,
                 args: args.into(),
             },
-            InstrCacheable::Fnmadds(args) => Instruction {
+            Instr::Fnmadds(args) => Instruction {
                 opcode: OpCode::Fnmadds,
                 args: args.into(),
             },
-            InstrCacheable::FclassS(args) => Instruction {
+            Instr::FclassS(args) => Instruction {
                 opcode: OpCode::FclassS,
                 args: args.into(),
             },
-            InstrCacheable::FmvXW(args) => Instruction {
+            Instr::FmvXW(args) => Instruction {
                 opcode: OpCode::FmvXW,
                 args: args.into(),
             },
-            InstrCacheable::FmvWX(args) => Instruction {
+            Instr::FmvWX(args) => Instruction {
                 opcode: OpCode::FmvWX,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtsw(args) => Instruction {
+            Instr::Fcvtsw(args) => Instruction {
                 opcode: OpCode::Fcvtsw,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtswu(args) => Instruction {
+            Instr::Fcvtswu(args) => Instruction {
                 opcode: OpCode::Fcvtswu,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtsl(args) => Instruction {
+            Instr::Fcvtsl(args) => Instruction {
                 opcode: OpCode::Fcvtsl,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtslu(args) => Instruction {
+            Instr::Fcvtslu(args) => Instruction {
                 opcode: OpCode::Fcvtslu,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtws(args) => Instruction {
+            Instr::Fcvtws(args) => Instruction {
                 opcode: OpCode::Fcvtws,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtwus(args) => Instruction {
+            Instr::Fcvtwus(args) => Instruction {
                 opcode: OpCode::Fcvtwus,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtls(args) => Instruction {
+            Instr::Fcvtls(args) => Instruction {
                 opcode: OpCode::Fcvtls,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtlus(args) => Instruction {
+            Instr::Fcvtlus(args) => Instruction {
                 opcode: OpCode::Fcvtlus,
                 args: args.into(),
             },
 
             // RV64D instructions
-            InstrCacheable::Fld(args) => Instruction {
+            Instr::Fld(args) => Instruction {
                 opcode: OpCode::Fld,
                 args: args.to_args(InstrWidth::Uncompressed),
             },
-            InstrCacheable::Fsd(args) => Instruction {
+            Instr::Fsd(args) => Instruction {
                 opcode: OpCode::Fsd,
                 args: args.to_args(InstrWidth::Uncompressed),
             },
-            InstrCacheable::Feqd(args) => Instruction {
+            Instr::Feqd(args) => Instruction {
                 opcode: OpCode::Feqd,
                 args: args.into(),
             },
-            InstrCacheable::Fled(args) => Instruction {
+            Instr::Fled(args) => Instruction {
                 opcode: OpCode::Fled,
                 args: args.into(),
             },
-            InstrCacheable::Fltd(args) => Instruction {
+            Instr::Fltd(args) => Instruction {
                 opcode: OpCode::Fltd,
                 args: args.into(),
             },
-            InstrCacheable::Faddd(args) => Instruction {
+            Instr::Faddd(args) => Instruction {
                 opcode: OpCode::Faddd,
                 args: args.into(),
             },
-            InstrCacheable::Fsubd(args) => Instruction {
+            Instr::Fsubd(args) => Instruction {
                 opcode: OpCode::Fsubd,
                 args: args.into(),
             },
-            InstrCacheable::Fmuld(args) => Instruction {
+            Instr::Fmuld(args) => Instruction {
                 opcode: OpCode::Fmuld,
                 args: args.into(),
             },
-            InstrCacheable::Fdivd(args) => Instruction {
+            Instr::Fdivd(args) => Instruction {
                 opcode: OpCode::Fdivd,
                 args: args.into(),
             },
-            InstrCacheable::Fsqrtd(args) => Instruction {
+            Instr::Fsqrtd(args) => Instruction {
                 opcode: OpCode::Fsqrtd,
                 args: args.into(),
             },
-            InstrCacheable::Fmind(args) => Instruction {
+            Instr::Fmind(args) => Instruction {
                 opcode: OpCode::Fmind,
                 args: args.into(),
             },
-            InstrCacheable::Fmaxd(args) => Instruction {
+            Instr::Fmaxd(args) => Instruction {
                 opcode: OpCode::Fmaxd,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjd(args) => Instruction {
+            Instr::Fsgnjd(args) => Instruction {
                 opcode: OpCode::Fsgnjd,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjnd(args) => Instruction {
+            Instr::Fsgnjnd(args) => Instruction {
                 opcode: OpCode::Fsgnjnd,
                 args: args.into(),
             },
-            InstrCacheable::Fsgnjxd(args) => Instruction {
+            Instr::Fsgnjxd(args) => Instruction {
                 opcode: OpCode::Fsgnjxd,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtds(args) => Instruction {
+            Instr::Fcvtds(args) => Instruction {
                 opcode: OpCode::Fcvtds,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtsd(args) => Instruction {
+            Instr::Fcvtsd(args) => Instruction {
                 opcode: OpCode::Fcvtsd,
                 args: args.into(),
             },
-            InstrCacheable::Fmaddd(args) => Instruction {
+            Instr::Fmaddd(args) => Instruction {
                 opcode: OpCode::Fmaddd,
                 args: args.into(),
             },
-            InstrCacheable::Fmsubd(args) => Instruction {
+            Instr::Fmsubd(args) => Instruction {
                 opcode: OpCode::Fmsubd,
                 args: args.into(),
             },
-            InstrCacheable::Fnmsubd(args) => Instruction {
+            Instr::Fnmsubd(args) => Instruction {
                 opcode: OpCode::Fnmsubd,
                 args: args.into(),
             },
-            InstrCacheable::Fnmaddd(args) => Instruction {
+            Instr::Fnmaddd(args) => Instruction {
                 opcode: OpCode::Fnmaddd,
                 args: args.into(),
             },
-            InstrCacheable::FclassD(args) => Instruction {
+            Instr::FclassD(args) => Instruction {
                 opcode: OpCode::FclassD,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtdw(args) => Instruction {
+            Instr::Fcvtdw(args) => Instruction {
                 opcode: OpCode::Fcvtdw,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtdwu(args) => Instruction {
+            Instr::Fcvtdwu(args) => Instruction {
                 opcode: OpCode::Fcvtdwu,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtdl(args) => Instruction {
+            Instr::Fcvtdl(args) => Instruction {
                 opcode: OpCode::Fcvtdl,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtdlu(args) => Instruction::new_f64_from_x64_unsigned(
+            Instr::Fcvtdlu(args) => Instruction::new_f64_from_x64_unsigned(
                 args.rd,
                 args.rs1,
                 args.rm,
                 InstrWidth::Uncompressed,
             ),
-            InstrCacheable::Fcvtwd(args) => Instruction {
+            Instr::Fcvtwd(args) => Instruction {
                 opcode: OpCode::Fcvtwd,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtwud(args) => Instruction {
+            Instr::Fcvtwud(args) => Instruction {
                 opcode: OpCode::Fcvtwud,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtld(args) => Instruction {
+            Instr::Fcvtld(args) => Instruction {
                 opcode: OpCode::Fcvtld,
                 args: args.into(),
             },
-            InstrCacheable::Fcvtlud(args) => Instruction {
+            Instr::Fcvtlud(args) => Instruction {
                 opcode: OpCode::Fcvtlud,
                 args: args.into(),
             },
-            InstrCacheable::FmvXD(args) => Instruction {
+            Instr::FmvXD(args) => Instruction {
                 opcode: OpCode::FmvXD,
                 args: args.into(),
             },
-            InstrCacheable::FmvDX(args) => Instruction {
+            Instr::FmvDX(args) => Instruction {
                 opcode: OpCode::FmvDX,
                 args: args.into(),
             },
 
             // Zicsr instructions
-            InstrCacheable::Csrrw(args) => Instruction {
+            Instr::Csrrw(args) => Instruction {
                 opcode: OpCode::Csrrw,
                 args: args.into(),
             },
-            InstrCacheable::Csrrs(args) => Instruction {
+            Instr::Csrrs(args) => Instruction {
                 opcode: OpCode::Csrrs,
                 args: args.into(),
             },
-            InstrCacheable::Csrrc(args) => Instruction {
+            Instr::Csrrc(args) => Instruction {
                 opcode: OpCode::Csrrc,
                 args: args.into(),
             },
-            InstrCacheable::Csrrwi(args) => Instruction {
+            Instr::Csrrwi(args) => Instruction {
                 opcode: OpCode::Csrrwi,
                 args: args.into(),
             },
-            InstrCacheable::Csrrsi(args) => Instruction {
+            Instr::Csrrsi(args) => Instruction {
                 opcode: OpCode::Csrrsi,
                 args: args.into(),
             },
-            InstrCacheable::Csrrci(args) => Instruction {
+            Instr::Csrrci(args) => Instruction {
                 opcode: OpCode::Csrrci,
                 args: args.into(),
             },
 
             // RV32C compressed instructions
-            InstrCacheable::CLw(args) => {
+            Instr::CLw(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 4 == 0);
                 Instruction::new_x32_load_signed(
                     args.rd.into(),
@@ -2136,7 +2151,7 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CLwsp(args) => {
+            Instr::CLwsp(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 4 == 0);
                 Instruction::new_x32_load_signed(
                     args.rd_rs1.into(),
@@ -2145,7 +2160,7 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CSw(args) => {
+            Instr::CSw(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 4 == 0);
                 Instruction::new_x32_store(
                     args.rs1.into(),
@@ -2154,56 +2169,48 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CSwsp(args) => {
+            Instr::CSwsp(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 4 == 0);
                 Instruction::new_x32_store(sp, args.rs2, args.imm, InstrWidth::Compressed)
             }
-            InstrCacheable::CJ(args) => Instruction::new_jump_pc(args.imm, InstrWidth::Compressed),
-            InstrCacheable::CJr(args) => Instruction::new_jr(args.rs1, InstrWidth::Compressed),
-            InstrCacheable::CJalr(args) => {
-                Instruction::new_jalr(nz::ra, args.rs1, InstrWidth::Compressed)
-            }
-            InstrCacheable::CBeqz(args) => Instruction::from_ic_cbeqz(args),
-            InstrCacheable::CBnez(args) => Instruction::from_ic_cbnez(args),
-            InstrCacheable::CLi(args) => {
-                Instruction::new_li(args.rd_rs1, args.imm, InstrWidth::Compressed)
-            }
-            InstrCacheable::CLui(args) => {
-                Instruction::new_li(args.rd_rs1, args.imm, InstrWidth::Compressed)
-            }
-            InstrCacheable::CAddi(args) => {
+            Instr::CJ(args) => Instruction::new_jump_pc(args.imm, InstrWidth::Compressed),
+            Instr::CJr(args) => Instruction::new_jr(args.rs1, InstrWidth::Compressed),
+            Instr::CJalr(args) => Instruction::new_jalr(nz::ra, args.rs1, InstrWidth::Compressed),
+            Instr::CBeqz(args) => Instruction::from_cbeqz(args),
+            Instr::CBnez(args) => Instruction::from_cbnez(args),
+            Instr::CLi(args) => Instruction::new_li(args.rd_rs1, args.imm, InstrWidth::Compressed),
+            Instr::CLui(args) => Instruction::new_li(args.rd_rs1, args.imm, InstrWidth::Compressed),
+            Instr::CAddi(args) => {
                 Instruction::new_addi(args.rd_rs1, args.rd_rs1, args.imm, InstrWidth::Compressed)
             }
-            InstrCacheable::CAddi16sp(args) => Instruction::new_addi(
+            Instr::CAddi16sp(args) => Instruction::new_addi(
                 NonZeroXRegister::x2,
                 NonZeroXRegister::x2,
                 args.imm,
                 InstrWidth::Compressed,
             ),
-            InstrCacheable::CAddi4spn(args) => Instruction::from_ic_caddi4spn(args),
-            InstrCacheable::CSlli(args) => Instruction::new_shift_left_immediate(
+            Instr::CAddi4spn(args) => Instruction::from_caddi4spn(args),
+            Instr::CSlli(args) => Instruction::new_x64_shift_left_imm(
                 args.rd_rs1,
                 args.rd_rs1,
                 args.imm,
                 InstrWidth::Compressed,
             ),
-            InstrCacheable::CSrli(args) => Instruction::from_ic_csrli(args),
-            InstrCacheable::CSrai(args) => Instruction::from_ic_csrai(args),
-            InstrCacheable::CAndi(args) => Instruction::from_ic_candi(args),
-            InstrCacheable::CMv(args) => {
-                Instruction::new_mv(args.rd_rs1, args.rs2, InstrWidth::Compressed)
+            Instr::CSrli(args) => Instruction::from_csrli(args),
+            Instr::CSrai(args) => Instruction::from_csrai(args),
+            Instr::CAndi(args) => Instruction::from_candi(args),
+            Instr::CMv(args) => Instruction::new_mv(args.rd_rs1, args.rs2, InstrWidth::Compressed),
+            Instr::CAdd(args) => {
+                Instruction::new_x64_add(args.rd_rs1, args.rd_rs1, args.rs2, InstrWidth::Compressed)
             }
-            InstrCacheable::CAdd(args) => {
-                Instruction::new_add(args.rd_rs1, args.rd_rs1, args.rs2, InstrWidth::Compressed)
-            }
-            InstrCacheable::CAnd(args) => Instruction::from_ic_cand(args),
-            InstrCacheable::CXor(args) => Instruction::from_ic_cxor(args),
-            InstrCacheable::COr(args) => Instruction::from_ic_cor(args),
-            InstrCacheable::CSub(args) => Instruction::from_ic_csub(args),
-            InstrCacheable::CNop => Instruction::new_nop(InstrWidth::Compressed),
+            Instr::CAnd(args) => Instruction::from_cand(args),
+            Instr::CXor(args) => Instruction::from_cxor(args),
+            Instr::COr(args) => Instruction::from_cor(args),
+            Instr::CSub(args) => Instruction::from_csub(args),
+            Instr::CNop => Instruction::new_nop(InstrWidth::Compressed),
 
             // RV64C compressed instructions
-            InstrCacheable::CLd(args) => {
+            Instr::CLd(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 8 == 0);
                 Instruction::new_x64_load_signed(
                     args.rd.into(),
@@ -2212,7 +2219,7 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CLdsp(args) => {
+            Instr::CLdsp(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 8 == 0);
                 Instruction::new_x64_load_signed(
                     args.rd_rs1.into(),
@@ -2221,7 +2228,7 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CSd(args) => {
+            Instr::CSd(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 8 == 0);
                 Instruction::new_x64_store(
                     args.rs1.into(),
@@ -2230,53 +2237,55 @@ impl From<&InstrCacheable> for Instruction {
                     InstrWidth::Compressed,
                 )
             }
-            InstrCacheable::CSdsp(args) => {
+            Instr::CSdsp(args) => {
                 debug_assert!(args.imm >= 0 && args.imm % 8 == 0);
                 Instruction::new_x64_store(sp, args.rs2, args.imm, InstrWidth::Compressed)
             }
-            InstrCacheable::CAddiw(args) => Instruction::new_add_word_immediate(
+            Instr::CAddiw(args) => Instruction::new_add_word_immediate(
                 args.rd_rs1,
                 args.rd_rs1.into(),
                 args.imm,
                 InstrWidth::Compressed,
             ),
-            InstrCacheable::CAddw(args) => Instruction::from_ic_caddw(args),
-            InstrCacheable::CSubw(args) => Instruction::from_ic_csubw(args),
+            Instr::CAddw(args) => Instruction::from_caddw(args),
+            Instr::CSubw(args) => Instruction::from_csubw(args),
 
             // RV64DC compressed instructions
-            InstrCacheable::CFld(args) => Instruction {
+            Instr::CFld(args) => Instruction {
                 opcode: OpCode::CFld,
                 args: args.to_args(InstrWidth::Compressed),
             },
-            InstrCacheable::CFldsp(args) => Instruction {
+            Instr::CFldsp(args) => Instruction {
                 opcode: OpCode::CFldsp,
                 args: args.into(),
             },
-            InstrCacheable::CFsd(args) => Instruction {
+            Instr::CFsd(args) => Instruction {
                 opcode: OpCode::CFsd,
                 args: args.to_args(InstrWidth::Compressed),
             },
-            InstrCacheable::CFsdsp(args) => Instruction {
+            Instr::CFsdsp(args) => Instruction {
                 opcode: OpCode::CFsdsp,
                 args: args.into(),
             },
 
-            InstrCacheable::Unknown { instr: _ } => {
-                Instruction::new_unknown(InstrWidth::Uncompressed)
-            }
-            InstrCacheable::UnknownCompressed { instr: _ } => {
+            Instr::Unknown { instr: _ } => Instruction::new_unknown(InstrWidth::Uncompressed),
+            Instr::UnknownCompressed { instr: _ } => {
                 Instruction::new_unknown(InstrWidth::Compressed)
             }
 
-            InstrCacheable::Hint { instr: _ } => Instruction::new_nop(InstrWidth::Uncompressed),
-            InstrCacheable::HintCompressed { instr: _ } => {
-                Instruction::new_nop(InstrWidth::Compressed)
-            }
+            Instr::Hint { instr: _ } => Instruction::new_nop(InstrWidth::Uncompressed),
+            Instr::HintCompressed { instr: _ } => Instruction::new_nop(InstrWidth::Compressed),
 
             // Interrupt-Management
-            InstrCacheable::Wfi => Instruction::new_nop(InstrWidth::Uncompressed),
+            Instr::Wfi => Instruction::new_nop(InstrWidth::Uncompressed),
 
-            InstrCacheable::Ecall => Instruction::new_ecall(),
+            Instr::Ecall => Instruction::new_ecall(),
+            Instr::Ebreak => Instruction::new_ebreak(InstrWidth::Uncompressed),
+            Instr::CEbreak => Instruction::new_ebreak(InstrWidth::Compressed),
+
+            Instr::Fence(_args) => Instruction::new_nop(InstrWidth::Uncompressed),
+            Instr::FenceTso => Instruction::new_nop(InstrWidth::Uncompressed),
+            Instr::FenceI => Instruction::new_fence_i(),
         }
     }
 }

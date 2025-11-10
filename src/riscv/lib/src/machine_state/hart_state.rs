@@ -3,6 +3,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use perfect_derive::perfect_derive;
+
 use crate::machine_state::csregisters;
 use crate::machine_state::memory::Address;
 use crate::machine_state::registers;
@@ -19,6 +21,7 @@ use crate::state_context::projection::MachineCoreCons;
 use crate::state_context::projection::impl_projection;
 
 /// RISC-V hart state
+#[perfect_derive(Clone)]
 pub struct HartState<M: backend::ManagerBase> {
     /// Integer registers
     pub xregisters: registers::XRegisters<M>,
@@ -99,18 +102,6 @@ impl<M: backend::ManagerBase> NewState<M> for HartState<M> {
     }
 }
 
-impl<M: backend::ManagerClone> Clone for HartState<M> {
-    fn clone(&self) -> Self {
-        Self {
-            xregisters: self.xregisters.clone(),
-            fregisters: self.fregisters.clone(),
-            csregisters: self.csregisters.clone(),
-            pc: self.pc.clone(),
-            reservation_set: self.reservation_set.clone(),
-        }
-    }
-}
-
 impl_projection! {
     projection ProgramCounterProj {
         subject = MachineCoreCons,
@@ -121,6 +112,6 @@ impl_projection! {
 
 /// Update the program counter in the given state context.
 #[inline]
-pub(crate) fn write_pc<SC: StateContext + ?Sized>(state: &mut SC, value: SC::X64) {
+pub(crate) fn write_pc<SC: StateContext + ?Sized>(state: &mut SC, value: SC::Value<XValue>) {
     state.write_proj::<ProgramCounterProj>((), value);
 }

@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Add;
 use std::ops::Deref;
 use std::ops::Sub;
+
+use bincode::Decode;
+use bincode::Encode;
 
 use crate::default::ConstDefault;
 use crate::machine_state;
@@ -19,11 +21,16 @@ use crate::machine_state;
     Eq,
     PartialOrd,
     Ord,
-    serde::Serialize,
-    serde::Deserialize,
+    Encode,
+    Decode,
     derive_more::From,
+    derive_more::Debug,
+    derive_more::Display,
 )]
 #[repr(transparent)]
+#[cfg_attr(test, derive(Default))]
+#[debug("{}", self)]
+#[display("{:#x}", self.0)]
 pub struct VirtAddr(u64);
 
 impl VirtAddr {
@@ -60,6 +67,11 @@ impl VirtAddr {
         self.0.rem_euclid(align.get()) == 0
     }
 
+    /// Is the address NULL?
+    pub const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
     /// Convert the virtual address to the machine state's memory address representation.
     pub fn to_machine_address(self) -> machine_state::memory::Address {
         self.0
@@ -68,18 +80,6 @@ impl VirtAddr {
 
 impl ConstDefault for VirtAddr {
     const DEFAULT: Self = VirtAddr(u64::MAX);
-}
-
-impl fmt::Debug for VirtAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#x}", self.0)
-    }
-}
-
-impl fmt::Display for VirtAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#x}", self.0)
-    }
 }
 
 impl Add<u64> for VirtAddr {

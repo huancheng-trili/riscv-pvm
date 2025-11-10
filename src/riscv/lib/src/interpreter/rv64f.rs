@@ -12,6 +12,7 @@ use rustc_apfloat::StatusAnd;
 use rustc_apfloat::ieee::Single;
 
 use super::float::FloatExt;
+use crate::exceptions::Exception;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::hart_state::HartState;
 use crate::machine_state::memory;
@@ -20,7 +21,6 @@ use crate::machine_state::registers::FValue;
 use crate::machine_state::registers::XRegister;
 use crate::parser::instruction::InstrRoundingMode;
 use crate::state_backend as backend;
-use crate::traps::Exception;
 
 impl From<Single> for FValue {
     fn from(f: Single) -> Self {
@@ -58,48 +58,29 @@ where
     /// `FCLASS.S` F-type instruction.
     ///
     /// See [Self::run_fclass].
-    pub fn run_fclass_s(&mut self, rs1: FRegister, rd: XRegister) -> Result<(), Exception> {
+    pub fn run_fclass_s(&mut self, rs1: FRegister, rd: XRegister) {
         self.run_fclass::<Single>(rs1, rd);
-        Ok(())
     }
 
     /// `FEQ.S` R-type instruction.
     ///
     /// See [Self::run_feq].
-    pub fn run_feq_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_feq_s(&mut self, rs1: FRegister, rs2: FRegister, rd: XRegister) {
         self.run_feq::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FLE.S` R-type instruction.
     ///
     /// See [Self::run_fle].
-    pub fn run_fle_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fle_s(&mut self, rs1: FRegister, rs2: FRegister, rd: XRegister) {
         self.run_fle::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FLT.S` R-type instruction.
     ///
     /// See [Self::run_flt].
-    pub fn run_flt_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_flt_s(&mut self, rs1: FRegister, rs2: FRegister, rd: XRegister) {
         self.run_flt::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FADD.S` R-type instruction.
@@ -111,8 +92,8 @@ where
         rs2: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fadd::<Single>(rs1, rs2, rm, rd)
+    ) {
+        self.run_fadd::<Single>(rs1, rs2, rm, rd);
     }
 
     /// `FSUB.S` R-type instruction.
@@ -124,8 +105,8 @@ where
         rs2: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fsub::<Single>(rs1, rs2, rm, rd)
+    ) {
+        self.run_fsub::<Single>(rs1, rs2, rm, rd);
     }
 
     /// `FMUL.S` R-type instruction.
@@ -137,8 +118,8 @@ where
         rs2: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fmul::<Single>(rs1, rs2, rm, rd)
+    ) {
+        self.run_fmul::<Single>(rs1, rs2, rm, rd);
     }
 
     /// `FDIV.S` R-type instruction.
@@ -150,57 +131,38 @@ where
         rs2: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fdiv::<Single>(rs1, rs2, rm, rd)
+    ) {
+        self.run_fdiv::<Single>(rs1, rs2, rm, rd);
     }
 
     /// `FSQRT.S` R-type instruction.
-    pub fn run_fsqrt_s(
-        &mut self,
-        rs1: FRegister,
-        rm: InstrRoundingMode,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fsqrt_s(&mut self, rs1: FRegister, rm: InstrRoundingMode, rd: FRegister) {
         let rval = self.fregisters.read(rs1);
-        let rm = self.f_rounding_mode(rm)?;
+        let rm = self.f_rounding_mode(rm);
 
         let rval = fvalue_to_f32_bits(rval);
 
         let (StatusAnd { status, value }, _iterations) = ieee_apsqrt::sqrt_accurate(rval, rm);
 
         if status != Status::OK {
-            self.csregisters.set_exception_flag_status(status);
+            self.csregisters.import_float_exception_flags(status);
         }
 
         self.fregisters.write(rd, f32_to_fvalue(value));
-
-        Ok(())
     }
 
     /// `FMIN.S` R-type instruction.
     ///
     /// See [Self::run_fmin].
-    pub fn run_fmin_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fmin_s(&mut self, rs1: FRegister, rs2: FRegister, rd: FRegister) {
         self.run_fmin::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FMAX.S` R-type instruction.
     ///
     /// See [Self::run_fmax].
-    pub fn run_fmax_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fmax_s(&mut self, rs1: FRegister, rs2: FRegister, rd: FRegister) {
         self.run_fmax::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FMADD.S` instruction.
@@ -213,8 +175,8 @@ where
         rs3: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fmadd::<Single>(rs1, rs2, rs3, rm, rd)
+    ) {
+        self.run_fmadd::<Single>(rs1, rs2, rs3, rm, rd);
     }
 
     /// `FMSUB.S` instruction.
@@ -227,8 +189,8 @@ where
         rs3: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fmsub::<Single>(rs1, rs2, rs3, rm, rd)
+    ) {
+        self.run_fmsub::<Single>(rs1, rs2, rs3, rm, rd);
     }
 
     /// `FNMSUB.S` instruction.
@@ -241,8 +203,8 @@ where
         rs3: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fnmsub::<Single>(rs1, rs2, rs3, rm, rd)
+    ) {
+        self.run_fnmsub::<Single>(rs1, rs2, rs3, rm, rd);
     }
 
     /// `FNMADD.S` instruction.
@@ -255,159 +217,101 @@ where
         rs3: FRegister,
         rm: InstrRoundingMode,
         rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fnmadd::<Single>(rs1, rs2, rs3, rm, rd)
+    ) {
+        self.run_fnmadd::<Single>(rs1, rs2, rs3, rm, rd);
     }
 
     /// `FCVT.S.W` R-type instruction.
     ///
     /// See [Self::run_fcvt_int_fmt].
-    pub fn run_fcvt_s_w(
-        &mut self,
-        rs1: XRegister,
-        rm: InstrRoundingMode,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as i32 as i128, Single::from_i128_r)
+    pub fn run_fcvt_s_w(&mut self, rs1: XRegister, rm: InstrRoundingMode, rd: FRegister) {
+        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as i32 as i128, Single::from_i128_r);
     }
 
     /// `FCVT.S.WU` R-type instruction.
     ///
     /// See [Self::run_fcvt_int_fmt].
-    pub fn run_fcvt_s_wu(
-        &mut self,
-        rs1: XRegister,
-        rm: InstrRoundingMode,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as u32 as u128, Single::from_u128_r)
+    pub fn run_fcvt_s_wu(&mut self, rs1: XRegister, rm: InstrRoundingMode, rd: FRegister) {
+        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as u32 as u128, Single::from_u128_r);
     }
 
     /// `FCVT.S.W` R-type instruction.
     ///
     /// See [Self::run_fcvt_int_fmt].
-    pub fn run_fcvt_s_l(
-        &mut self,
-        rs1: XRegister,
-        rm: InstrRoundingMode,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as i64 as i128, Single::from_i128_r)
+    pub fn run_fcvt_s_l(&mut self, rs1: XRegister, rm: InstrRoundingMode, rd: FRegister) {
+        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as i64 as i128, Single::from_i128_r);
     }
 
     /// `FCVT.S.WU` R-type instruction.
     ///
     /// See [Self::run_fcvt_int_fmt].
-    pub fn run_fcvt_s_lu(
-        &mut self,
-        rs1: XRegister,
-        rm: InstrRoundingMode,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
-        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as u128, Single::from_u128_r)
+    pub fn run_fcvt_s_lu(&mut self, rs1: XRegister, rm: InstrRoundingMode, rd: FRegister) {
+        self.run_fcvt_int_fmt(rs1, rm, rd, |u| u as u128, Single::from_u128_r);
     }
 
     /// `FCVT.S.W` R-type instruction.
-    pub fn run_fcvt_w_s(
-        &mut self,
-        rs1: FRegister,
-        rm: InstrRoundingMode,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fcvt_w_s(&mut self, rs1: FRegister, rm: InstrRoundingMode, rd: XRegister) {
         self.run_fcvt_fmt_int(
             rs1,
             rm,
             rd,
             |u| u as i32 as u64,
             |f, rm| Single::to_i128_r(f, 32, rm, &mut false),
-        )
+        );
     }
 
     /// `FCVT.S.WU` R-type instruction.
-    pub fn run_fcvt_wu_s(
-        &mut self,
-        rs1: FRegister,
-        rm: InstrRoundingMode,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fcvt_wu_s(&mut self, rs1: FRegister, rm: InstrRoundingMode, rd: XRegister) {
         self.run_fcvt_fmt_int(
             rs1,
             rm,
             rd,
             |u| u as i32 as u64,
             |f, rm| Single::to_u128_r(f, 32, rm, &mut false),
-        )
+        );
     }
 
     /// `FCVT.S.W` R-type instruction.
-    pub fn run_fcvt_l_s(
-        &mut self,
-        rs1: FRegister,
-        rm: InstrRoundingMode,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fcvt_l_s(&mut self, rs1: FRegister, rm: InstrRoundingMode, rd: XRegister) {
         self.run_fcvt_fmt_int(
             rs1,
             rm,
             rd,
             |u| u as u64,
             |f, rm| Single::to_i128_r(f, 64, rm, &mut false),
-        )
+        );
     }
 
     /// `FCVT.S.WU` R-type instruction.
-    pub fn run_fcvt_lu_s(
-        &mut self,
-        rs1: FRegister,
-        rm: InstrRoundingMode,
-        rd: XRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fcvt_lu_s(&mut self, rs1: FRegister, rm: InstrRoundingMode, rd: XRegister) {
         self.run_fcvt_fmt_int(
             rs1,
             rm,
             rd,
             |u| u as u64,
             |f, rm| Single::to_u128_r(f, 64, rm, &mut false),
-        )
+        );
     }
 
     /// `FSGNJ.S` R-type instruction.
     ///
     /// See [Self::run_fsgnj].
-    pub fn run_fsgnj_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fsgnj_s(&mut self, rs1: FRegister, rs2: FRegister, rd: FRegister) {
         self.run_fsgnj::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FSGNJN.S` R-type instruction.
     ///
     /// See [Self::run_fsgnjn].
-    pub fn run_fsgnjn_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fsgnjn_s(&mut self, rs1: FRegister, rs2: FRegister, rd: FRegister) {
         self.run_fsgnjn::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FSGNJX.S` R-type instruction.
     ///
     /// See [Self::run_fsgnjx].
-    pub fn run_fsgnjx_s(
-        &mut self,
-        rs1: FRegister,
-        rs2: FRegister,
-        rd: FRegister,
-    ) -> Result<(), Exception> {
+    pub fn run_fsgnjx_s(&mut self, rs1: FRegister, rs2: FRegister, rd: FRegister) {
         self.run_fsgnjx::<Single>(rs1, rs2, rd);
-        Ok(())
     }
 
     /// `FMV.X.W` F-type instruction
@@ -421,12 +325,11 @@ where
     ///
     /// The higher 32 bits of the destination register are filled with copies
     /// of the floating-point number’s sign bit.
-    pub fn run_fmv_x_w(&mut self, rs1: FRegister, rd: XRegister) -> Result<(), Exception> {
+    pub fn run_fmv_x_w(&mut self, rs1: FRegister, rd: XRegister) {
         let rval: u64 = self.fregisters.read(rs1).into();
         let rval = rval as i32 as u64;
 
         self.xregisters.write(rd, rval);
-        Ok(())
     }
 
     /// `FMV.W.X` F-type instruction
@@ -437,12 +340,11 @@ where
     ///
     /// The bits are not modified in the transfer,
     /// and in particular, the payloads of non-canonical NaNs are preserved.
-    pub fn run_fmv_w_x(&mut self, rs1: XRegister, rd: FRegister) -> Result<(), Exception> {
+    pub fn run_fmv_w_x(&mut self, rs1: XRegister, rd: FRegister) {
         let rval = self.xregisters.read(rs1) as u32;
         let rval = f32_to_fvalue(rval);
 
         self.fregisters.write(rd, rval);
-        Ok(())
     }
 }
 
@@ -501,16 +403,17 @@ mod tests {
 
     use super::f32_to_fvalue;
     use crate::backend_test;
+    use crate::exceptions::Exception;
     use crate::machine_state::MachineCoreState;
     use crate::machine_state::hart_state::HartState;
     use crate::machine_state::memory::M4K;
+    use crate::machine_state::memory::listener::NoopMemoryGovernanceListener;
     use crate::machine_state::registers::fa1;
     use crate::machine_state::registers::fa4;
     use crate::machine_state::registers::parse_fregister;
     use crate::machine_state::registers::parse_xregister;
     use crate::machine_state::registers::t0;
     use crate::state::NewState;
-    use crate::traps::Exception;
 
     backend_test!(test_fmv_f, F, {
         proptest!(|(
@@ -523,7 +426,7 @@ mod tests {
 
             state.xregisters.write(rs1, f as u64);
 
-            assert!(state.run_fmv_w_x(rs1, rs1_f).is_ok());
+            state.run_fmv_w_x(rs1, rs1_f);
 
             let read: u64 = state.fregisters.read(rs1_f).into();
             assert_eq!(f, read as u32, "Expected bits to be moved to fregister");
@@ -531,7 +434,7 @@ mod tests {
             let f_64 = Double::from_bits(read as u128);
             assert!(f_64.is_nan() && !f_64.is_signaling());
 
-            assert!(state.run_fmv_x_w(rs1_f, rs2).is_ok());
+            state.run_fmv_x_w(rs1_f, rs2);
 
             let read = state.xregisters.read(rs2);
             assert_eq!(f, read as u32, "Expected bits to be moved to xregister");
@@ -554,8 +457,8 @@ mod tests {
         )|
         {
             let mut state = state_cell.borrow_mut();
-            state.reset();
-            state.main_memory.set_all_readable_writeable();
+            state.reset(NoopMemoryGovernanceListener);
+            state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
             let mut perform_test = |offset: u64| -> Result<(), Exception> {
                 // Save test values v_i in registers ai
@@ -579,7 +482,7 @@ mod tests {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(invalid_offset).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
             // Aligned loads / stores
             prop_assert!(perform_test(aligned_offset).is_ok());
@@ -588,7 +491,7 @@ mod tests {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(invalid_offset).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
             // Aligned loads / stores
             prop_assert!(perform_test(aligned_offset).is_ok());

@@ -4,25 +4,10 @@
 
 //! Loading and storing of temporary values to/from the stack.
 //!
-//! Certain information is occassionally required to be on the stack, when executing
+//! Certain information is occasionally required to be on the stack, when executing
 //! a JIT-compiled block.
 //!
-//! See for example [`handle_exception`]:
-//!
-//! ```ignore
-//! use crate::machine_state::MachineCoreState;
-//! use crate::machine_state::memory::Address;
-//! use crate::machine_state::memory::MemoryConfig;
-//! use crate::traps::EnvironException;
-//! use crate::traps::Exception;
-//!
-//! extern "C" fn handle_exception<MC: MemoryConfig>(
-//!     core: &mut MachineCoreState<MC, Owned>,
-//!     current_pc: &mut Address,
-//!     exception: &Option<Exception>,
-//!     result: &mut Result<(), EnvironException>,
-//! ) -> bool;
-//! ```
+//! See [`crate::jit::state_access`] for examples.
 //!
 //! The boolean return indicates whether the function has failed. If it has, then an exception will
 //! have been written to the place in memory specified by `exception`. `current_pc` is also an out
@@ -34,8 +19,6 @@
 //! Larger/more complex types cannot be moved between registers and the stack safely. Exceptions
 //! are a good example of this. For now, we choose to pass pointers from values created in rust
 //! code, for safety.
-//!
-//! [`handle_exception`]: super::handle_exception
 
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -48,14 +31,15 @@ use cranelift::codegen::ir::StackSlotKind;
 use cranelift::codegen::ir::Type;
 use cranelift::codegen::ir::types::I64;
 use cranelift::frontend::FunctionBuilder;
-use cranelift::prelude::types::F64;
 use cranelift::prelude::types::I8;
 use cranelift::prelude::types::I16;
 use cranelift::prelude::types::I32;
+use perfect_derive::perfect_derive;
 
+use crate::exceptions::Exception;
 use crate::jit::builder::typed::Pointer;
 use crate::jit::builder::typed::Value;
-use crate::traps::Exception;
+use crate::machine_state::registers::FValue;
 
 /// Any value of type `T: StackAddressable` may be placed on the stack, and
 /// a pointer to it obtained.
@@ -134,15 +118,16 @@ impl_stackable_int!(16);
 impl_stackable_int!(32);
 impl_stackable_int!(64);
 
-impl StackAddressable for f64 {
-    type Underlying = f64;
+impl StackAddressable for FValue {
+    type Underlying = FValue;
 }
 
-impl Stackable for f64 {
-    const IR_TYPE: Type = F64;
+impl Stackable for FValue {
+    const IR_TYPE: Type = I64;
 }
 
 /// Dedicated space on the stack to store a value of the underlying type.
+#[perfect_derive(Clone)]
 pub(super) struct Slot<T> {
     slot: StackSlot,
     ptr_type: Type,
@@ -175,18 +160,6 @@ impl<T: StackAddressable> Slot<MaybeUninit<T>> {
     }
 }
 
-impl<T: Stackable> Slot<MaybeUninit<T>> {
-    /// Emit IR to initialise the stack slot.
-    pub(super) fn init(self, builder: &mut FunctionBuilder, value: Value<T>) -> Slot<T> {
-        builder.ins().stack_store(value.to_value(), self.slot, 0);
-        Slot {
-            slot: self.slot,
-            ptr_type: self.ptr_type,
-            _pd: PhantomData,
-        }
-    }
-}
-
 impl<T: StackAddressable> Slot<T> {
     /// Get a pointer to the memory of the slot.
     pub(super) fn ptr(&self, builder: &mut FunctionBuilder) -> Pointer<T> {
@@ -204,15 +177,5 @@ impl<T: Stackable> Slot<T> {
 
         // SAFETY: `T` is the slot value type.
         unsafe { Value::<T>::from_raw(raw_value) }
-    }
-}
-
-impl<T> Clone for Slot<T> {
-    fn clone(&self) -> Self {
-        Self {
-            slot: self.slot,
-            ptr_type: self.ptr_type,
-            _pd: PhantomData,
-        }
     }
 }

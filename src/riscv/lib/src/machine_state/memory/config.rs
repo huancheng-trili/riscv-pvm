@@ -2,11 +2,14 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::num::NonZeroUsize;
+
 use super::buddy::BuddyLayout;
 use super::buddy::BuddyLayoutProxy;
 use super::protection::PagePermissions;
 use super::protection::PagePermissionsLayout;
 use super::state::MemoryImpl;
+use crate::machine_state::page_cache::state::PageCacheImpl;
 use crate::state::NewState;
 use crate::state_backend::AllocatedOf;
 use crate::state_backend::DynArray;
@@ -30,7 +33,7 @@ where
         M: ManagerAlloc,
     {
         MemoryImpl {
-            data: DynCells::new(),
+            data: DynCells::new(TOTAL_BYTES),
             readable_pages: PagePermissions::new(),
             writable_pages: PagePermissions::new(),
             executable_pages: PagePermissions::new(),
@@ -44,10 +47,11 @@ impl<const PAGES: usize, const TOTAL_BYTES: usize> super::MemoryConfig
 where
     BuddyLayoutProxy<PAGES>: BuddyLayout + 'static,
 {
-    const TOTAL_BYTES: usize = TOTAL_BYTES;
+    const TOTAL_BYTES: NonZeroUsize = NonZeroUsize::new(TOTAL_BYTES)
+        .expect("size of memory `TOTAL_BYTES` must be greater than zero");
 
     type Layout = (
-        DynArray<TOTAL_BYTES>,
+        DynArray,
         PagePermissionsLayout<PAGES>,
         PagePermissionsLayout<PAGES>,
         PagePermissionsLayout<PAGES>,
@@ -56,6 +60,11 @@ where
 
     type State<M: ManagerBase> =
         MemoryImpl<PAGES, TOTAL_BYTES, <BuddyLayoutProxy<PAGES> as BuddyLayout>::Buddy<M>, M>;
+
+    type PageCache<
+        CPE: crate::machine_state::page_cache::code_page_entry::CodePageEntry<Self, M>,
+        M: ManagerBase,
+    > = PageCacheImpl<PAGES, CPE, Self, M>;
 
     fn bind<M: ManagerBase>(space: AllocatedOf<Self::Layout, M>) -> Self::State<M> {
         if TOTAL_BYTES == 0 {
@@ -116,4 +125,6 @@ gen_memory_layout!(M1M = 1 MiB);
 gen_memory_layout!(M64M = 64 MiB);
 gen_memory_layout!(M1G = 1 GiB);
 gen_memory_layout!(M4G = 4 GiB);
+gen_memory_layout!(M16G = 16 GiB);
 gen_memory_layout!(M32G = 32 GiB);
+gen_memory_layout!(M64G = 64 GiB);

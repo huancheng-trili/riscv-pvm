@@ -12,7 +12,7 @@ on:
     branches: [main]
 
 concurrency:
-  # Cancel previous workflow runs for the same ref (e.g. same PR or branch) 
+  # Cancel previous workflow runs for the same ref (e.g. same PR or branch)
   group: ${{ github.workflow }}-${{ github.ref }}
 
   # Cancel only if it is not the main branch
@@ -28,6 +28,9 @@ env:
   # Make sure Sccache automatically uses the GitHub Actions cache
   SCCACHE_GHA_ENABLED: "true"
 
+  # Ensure the Nix formatter fails on changes
+  TREEFMT_CI: "true"
+
 jobs:
   run-make-target:
     strategy:
@@ -35,11 +38,16 @@ jobs:
       matrix:
         include:
           - runs-on: ubuntu-latest
-            make-target: check build audit
+            make-target: check check-nix build audit
             title: Linux Checks
           - runs-on: ubuntu-latest
-            make-target: test test-long
+            make-target: test
+            disk-cleanup: true
             title: Linux Tests
+          - runs-on: ubuntu-latest
+            make-target: riscv/codecov.json
+            code-coverage: true
+            title: Code Coverage
           - runs-on: macos-latest
             make-target: check build
             title: MacOS Checks
@@ -48,11 +56,35 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
 
     steps:
+      - name: Aggressive cleanup
+        if: matrix.disk-cleanup
+        run: |
+          # Remove Java (JDKs)
+          sudo rm -rf /usr/lib/jvm
+
+          # Remove .NET SDKs
+          sudo rm -rf /usr/share/dotnet
+
+          # Remove Swift toolchain
+          sudo rm -rf /usr/share/swift
+
+          # Remove Haskell (GHC)
+          sudo rm -rf /usr/local/.ghcup
+
+          # Remove Android SDKs
+          sudo rm -rf /usr/local/lib/android
+
+          # Remove Azure CLI
+          sudo rm -rf /opt/az
+
+          # Remove PowerShell
+          sudo rm -rf /usr/local/share/powershell
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Nix setup
-        uses: nixbuild/nix-quick-install-action@v32
+        uses: nixbuild/nix-quick-install-action@v34
         with:
           nix_conf: |
             keep-env-derivations = true
@@ -64,7 +96,7 @@ jobs:
         id: nix-cache
         uses: nix-community/cache-nix-action@v6
         with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}-v1
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}-v2
           restore-prefixes-first-match: |
             nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}-
             nix-${{ runner.os }}-${{ runner.arch }}-
@@ -72,9 +104,9 @@ jobs:
 
       - name: Restore Rustup and Cargo cache
         id: rust-cache
-        uses: actions/cache/restore@v4.2.3
+        uses: actions/cache/restore@v4.3.0
         with:
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain*') }}-v1
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain*') }}-v2
           restore-keys: |
             rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain*') }}-
             rust-${{ runner.os }}-${{ runner.arch }}-
@@ -85,29 +117,45 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
 
-      - name: Rust compilation cache 
+      - name: Rust compilation cache
         uses: Mozilla-Actions/sccache-action@v0.0.9
 
       - name: Pre-build Nix development shell
-        run: nix develop --profile ~/dev-shell --command true
+        run: |
+          # Direnv is not installed out of the box unfortunately.
+          nix profile install nixpkgs#direnv nixpkgs#nix-direnv
+
+          # Direnv is configured through `.envrc`. We create it, or override it in case one already
+          # exists.
+          echo "use flake" > .envrc
+
+          # Subsequent steps will have their environment configured using the $GITHUB_ENV variable.
+          direnv allow .
+          direnv export gha > "$GITHUB_ENV"
 
       # All downloads should be cached. If there is a cache miss, we should ensure that the cache
       # contains all downloads.
       - name: Prefetch Cargo downloads
-        if: steps.rust-cache.outputs.cache-hit != 'true' && github.ref_name == 'main' 
-        run: nix develop --command find src/riscv -iname Cargo.lock -execdir cargo fetch \;
+        if: steps.rust-cache.outputs.cache-hit != 'true' && github.ref_name == 'main'
+        run: find . -iname Cargo.lock -execdir cargo fetch \;
 
       - name: Build dependencies
-        run: nix develop --command make build-deps-slim
-        working-directory: src/riscv
+        run: make build-deps-slim
 
       - name: Run 'make ${{ matrix.make-target }}'
-        run: nix develop --command make ${{ matrix.make-target }}
-        working-directory: src/riscv
+        run: make ${{ matrix.make-target }}
+
+      - name: Analyse code coverage
+        if: matrix.code-coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: src/riscv/codecov.json
+          fail_ci_if_error: true
 
       - name: Save Rustup and Cargo cache
         if: github.ref_name == 'main'
-        uses: actions/cache/save@v4.2.3
+        uses: actions/cache/save@v4.3.0
         with:
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
           path: |
@@ -116,7 +164,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-      
+
       # Only when the primary-key cache was not found do we actually produce a cache. In that case
       # we need to clean up the Nix store a little to save space.
       - name: Clean up Nix store

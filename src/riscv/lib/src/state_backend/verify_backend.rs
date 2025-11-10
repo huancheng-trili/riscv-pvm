@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2024 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2024-2025 TriliTech <contact@trili.tech>
 // SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
 //
 // SPDX-License-Identifier: MIT
@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use std::ops::Index;
 use std::panic::resume_unwind;
 
+use bincode::Encode;
+use bincode::enc::Encoder;
+use bincode::error::EncodeError;
 use range_collections::RangeSet2;
-use serde::ser::SerializeTuple;
 
 use super::Cell;
-use super::EnrichedValue;
 use super::ManagerBase;
 use super::ManagerClone;
 use super::ManagerRead;
@@ -21,6 +22,7 @@ use super::ManagerWrite;
 use super::PartialHashError;
 use super::Ref;
 use crate::state_backend::Elem;
+use crate::state_backend::ProofError;
 use crate::state_backend::elem_bytes;
 use crate::state_backend::hash::Hash;
 use crate::state_backend::owned_backend::Owned;
@@ -54,8 +56,8 @@ pub(crate) fn handle_stepper_panics<R, F: FnOnce() -> R + std::panic::UnwindSafe
 /// Error during proof verification
 #[derive(Debug, thiserror::Error)]
 pub enum ProofVerificationFailure {
-    #[error("Unexpected proof shape")]
-    UnexpectedProofShape,
+    #[error("Deserialisation error: {0}")]
+    BadDeserialisation(#[from] ProofError),
 
     #[error("Stepper error")]
     StepperError,
@@ -79,20 +81,49 @@ pub struct Verifier;
 impl ManagerBase for Verifier {
     type Region<E: 'static, const LEN: usize> = Region<E, LEN>;
 
-    type DynRegion<const LEN: usize> = DynRegion<{ MERKLE_LEAF_SIZE.get() }, LEN>;
-
-    type EnrichedCell<V: EnrichedValue> = EnrichedCell<V>;
+    type DynRegion = DynRegion<{ MERKLE_LEAF_SIZE.get() }>;
 
     type ManagerRoot = Self;
+}
 
-    fn enrich_cell<V: super::EnrichedValueLinked>(
-        underlying: Self::Region<V::E, 1>,
-    ) -> Self::EnrichedCell<V> {
-        EnrichedCell { underlying }
+#[cfg(test)]
+mod test_helpers {
+    use crate::state_backend::ManagerAlloc;
+    use crate::state_backend::verify_backend::DynRegion;
+    use crate::state_backend::verify_backend::PageId;
+    use crate::state_backend::verify_backend::Region;
+    use crate::state_backend::verify_backend::Verifier;
+
+    impl<const LEAF_SIZE: usize> DynRegion<LEAF_SIZE> {
+        /// Construct a zero-initialized dynamic region.
+        pub(crate) fn zero_initialized(length: usize) -> Self {
+            let nr_pages = length.div_ceil(LEAF_SIZE);
+
+            Self::from_pages(
+                Some(length),
+                (0..nr_pages).map(|page_id| {
+                    let page_index = PageId::<LEAF_SIZE>::from_address(page_id * LEAF_SIZE);
+                    (page_index, Box::new([0; LEAF_SIZE]))
+                }),
+            )
+        }
+
+        /// Like [`Self::zero_initialized`] but all pages are absent.
+        pub(crate) fn absent(length: usize) -> Self {
+            Self::from_pages(Some(length), std::iter::empty())
+        }
     }
 
-    fn as_devalued_cell<V: EnrichedValue>(cell: &Self::EnrichedCell<V>) -> &Self::Region<V::E, 1> {
-        &cell.underlying
+    impl ManagerAlloc for Verifier {
+        fn allocate_region<E, const LEN: usize>(init_value: [E; LEN]) -> Self::Region<E, LEN> {
+            Region::Partial(Box::new(init_value.map(Some)))
+        }
+
+        fn allocate_dyn_region(length: usize) -> Self::DynRegion {
+            // Since this implementation is only for testing purposes, we can allocate the regions
+            // as zero initialized to mimic what an owned backend would do (to pass tests)
+            DynRegion::zero_initialized(length)
+        }
     }
 }
 
@@ -109,52 +140,16 @@ impl ManagerRead for Verifier {
         (0..LEN).map(|index| region[index]).collect()
     }
 
-    fn dyn_region_read<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-    ) -> E {
+    fn dyn_region_len(region: &Self::DynRegion) -> usize {
+        region.len()
+    }
+
+    unsafe fn dyn_region_read<E: Elem>(region: &Self::DynRegion, address: usize) -> E {
         let mut raw_data = vec![0u8; E::STORED_SIZE.get()];
         region.read_bytes(address, &mut raw_data);
 
         // SAFETY: The byte vector has been allocated with sufficient space.
         unsafe { E::read_unaligned(raw_data.as_ptr()) }
-    }
-
-    fn dyn_region_read_all<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-        values: &mut [E],
-    ) {
-        for (i, value) in values.iter_mut().enumerate() {
-            *value = Self::dyn_region_read(
-                region,
-                E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
-            );
-        }
-    }
-
-    fn enriched_cell_read_stored<V>(cell: &Self::EnrichedCell<V>) -> V::E
-    where
-        V: EnrichedValue,
-        V::E: Copy,
-    {
-        *Self::enriched_cell_ref_stored(cell)
-    }
-
-    fn enriched_cell_read_derived<V>(cell: &Self::EnrichedCell<V>) -> V::D
-    where
-        V: super::EnrichedValueLinked,
-        V::D: Copy,
-    {
-        let stored = Self::enriched_cell_ref_stored(cell);
-        V::derive(stored)
-    }
-
-    fn enriched_cell_ref_stored<V>(cell: &Self::EnrichedCell<V>) -> &V::E
-    where
-        V: EnrichedValue,
-    {
-        Self::region_ref(&cell.underlying, 0)
     }
 }
 
@@ -189,34 +184,9 @@ impl ManagerWrite for Verifier {
         }
     }
 
-    fn dyn_region_write<E: Elem, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
-        address: usize,
-        value: E,
-    ) {
+    unsafe fn dyn_region_write<E: Elem>(region: &mut Self::DynRegion, address: usize, value: E) {
         let raw_data = elem_bytes(value);
         region.write_bytes(address, &raw_data);
-    }
-
-    fn dyn_region_write_all<E: Elem + Copy, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
-        address: usize,
-        values: &[E],
-    ) {
-        for (i, value) in values.iter().enumerate() {
-            Self::dyn_region_write(
-                region,
-                E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
-                *value,
-            );
-        }
-    }
-
-    fn enriched_cell_write<V>(cell: &mut Self::EnrichedCell<V>, value: V::E)
-    where
-        V: super::EnrichedValueLinked,
-    {
-        Self::region_write(&mut cell.underlying, 0, value);
     }
 }
 
@@ -239,17 +209,8 @@ impl ManagerClone for Verifier {
         region.clone()
     }
 
-    fn clone_dyn_region<const LEN: usize>(region: &Self::DynRegion<LEN>) -> Self::DynRegion<LEN> {
+    fn clone_dyn_region(region: &Self::DynRegion) -> Self::DynRegion {
         region.clone()
-    }
-
-    fn clone_enriched_cell<V>(cell: &Self::EnrichedCell<V>) -> Self::EnrichedCell<V>
-    where
-        V: EnrichedValue,
-        V::E: Clone,
-        V::D: Clone,
-    {
-        cell.clone()
     }
 }
 
@@ -281,36 +242,17 @@ pub struct CompleteRegionRef<'a, E, const LEN: usize> {
     region: &'a [Option<E>; LEN],
 }
 
-impl<E: serde::Serialize, const LEN: usize> serde::Serialize for CompleteRegionRef<'_, E, LEN> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Replicate [`<Owned as ManagerSerialise>::serialise_region`]
+impl<T: Encode, const LEN: usize> Encode for CompleteRegionRef<'_, T, LEN> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        for elem in self.region {
+            let Some(elem) = elem.as_ref() else {
+                return Err(EncodeError::Other("Region is not complete"));
+            };
 
-        // A special encoding for single-element regions helps clean up encoding for serialisation
-        // formats that contain structures. For example, JSON, where single-element regions would
-        // be represented as array singletons.
-        if LEN == 1 {
-            return self
-                .region
-                .first()
-                .and_then(Option::as_ref)
-                .ok_or_else(|| <S::Error as serde::ser::Error>::custom("Region is not complete"))?
-                .serialize(serializer);
+            elem.encode(encoder)?;
         }
 
-        // We're serialising this as a fixed-sized tuple because otherwise `bincode` would prefix
-        // the length of this array, which is not needed.
-        let mut serializer = serializer.serialize_tuple(LEN)?;
-
-        for item in self.region.iter() {
-            serializer.serialize_element(item.as_ref().ok_or_else(|| {
-                <S::Error as serde::ser::Error>::custom("Region is not complete")
-            })?)?;
-        }
-
-        serializer.end()
+        Ok(())
     }
 }
 
@@ -363,7 +305,7 @@ impl<const LEAF_SIZE: usize> PageId<LEAF_SIZE> {
 
     const LEAF_MASK: usize = !(Self::LEAF_SIZE - 1);
 
-    /// Construct a page idetifier from an address.
+    /// Construct a page identifier from an address.
     pub fn from_address(address: usize) -> Self {
         PageId(address & Self::LEAF_MASK)
     }
@@ -437,33 +379,31 @@ impl<const LEAF_SIZE: usize> Default for Page<LEAF_SIZE> {
 
 /// Verifier dynamic region
 #[derive(Clone, Debug)]
-pub struct DynRegion<const LEAF_SIZE: usize, const LEN: usize> {
+pub struct DynRegion<const LEAF_SIZE: usize> {
+    length: Option<usize>,
     pages: BTreeMap<PageId<LEAF_SIZE>, Page<LEAF_SIZE>>,
 }
 
-impl<const LEAF_SIZE: usize, const LEN: usize> DynRegion<LEAF_SIZE, LEN> {
-    const SANE: bool = {
-        if LEN.rem_euclid(LEAF_SIZE) != 0 {
-            panic!("LEN must be a multiple of LEAF_SIZE")
+impl<const LEAF_SIZE: usize> DynRegion<LEAF_SIZE> {
+    /// Get the length of the dynamic region.
+    fn len(&self) -> usize {
+        match self.length {
+            Some(len) => len,
+            None => not_found(),
         }
-
-        true
-    };
+    }
 
     /// Construct a verifier dynamic region using the given known pages.
     pub fn from_pages(
+        length: Option<usize>,
         pages: impl IntoIterator<Item = (PageId<LEAF_SIZE>, Box<[u8; LEAF_SIZE]>)>,
     ) -> Self {
-        if !Self::SANE {
-            unreachable!()
-        }
-
         let pages = pages
             .into_iter()
             .map(|(id, data)| (id, Page::from_full(data)))
             .collect();
 
-        DynRegion { pages }
+        DynRegion { length, pages }
     }
 
     /// Read bytes from the dynamic region.
@@ -472,7 +412,7 @@ impl<const LEAF_SIZE: usize, const LEN: usize> DynRegion<LEAF_SIZE, LEN> {
             return;
         }
 
-        if buffer.len() > LEN.saturating_sub(address) {
+        if buffer.len() > self.len().saturating_sub(address) {
             not_found()
         }
 
@@ -506,7 +446,7 @@ impl<const LEAF_SIZE: usize, const LEN: usize> DynRegion<LEAF_SIZE, LEN> {
             return;
         }
 
-        if buffer.len() > LEN.saturating_sub(address) {
+        if buffer.len() > self.len().saturating_sub(address) {
             not_found()
         }
 
@@ -538,28 +478,21 @@ impl<const LEAF_SIZE: usize, const LEN: usize> DynRegion<LEAF_SIZE, LEN> {
             None => PartialState::Absent,
         }
     }
-}
 
-impl<const LEAF_SIZE: usize, const LEN: usize> Default for DynRegion<LEAF_SIZE, LEN> {
-    fn default() -> Self {
-        DynRegion {
-            pages: BTreeMap::new(),
-        }
+    /// Check whether no pages, not even the length is available.
+    ///
+    /// This would be the case when the dynamic region represents an absent or blinded node from
+    /// the compressed partial Merkle proof tree, and no data has been written to it.
+    pub(crate) fn is_completely_absent(&self) -> bool {
+        self.length.is_none() && self.pages.is_empty()
     }
 }
 
-/// Verifier enriched cell
-pub struct EnrichedCell<V: EnrichedValue> {
-    underlying: Region<V::E, 1>,
-}
-
-impl<V: EnrichedValue> Clone for EnrichedCell<V>
-where
-    V::E: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            underlying: self.underlying.clone(),
+impl<const LEAF_SIZE: usize> Default for DynRegion<LEAF_SIZE> {
+    fn default() -> Self {
+        DynRegion {
+            length: Some(LEAF_SIZE),
+            pages: BTreeMap::new(),
         }
     }
 }
@@ -595,10 +528,8 @@ impl<E: Clone> TryFrom<Cell<E, Ref<'_, Verifier>>> for Cell<E, Owned> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_backend;
     use crate::state_backend::Cells;
     use crate::state_backend::DynCells;
-    use crate::state_backend::EnrichedValueLinked;
 
     /// Ensures that page indices are properly calculated.
     #[test]
@@ -689,60 +620,6 @@ mod tests {
         }
     }
 
-    /// Construct a [`state_backend::EnrichedCell`] from a proptest value.
-    fn arb_to_enriched_cell<V: EnrichedValueLinked>(
-        value: Option<V::E>,
-    ) -> state_backend::EnrichedCell<V, Verifier> {
-        let cell = match value {
-            Some(value) => Region::Partial(Box::new([Some(value)])),
-            None => Region::Absent,
-        };
-        let cell = Cell::bind(cell);
-        state_backend::EnrichedCell::bind(cell)
-    }
-
-    /// Check the functionality of an enriched cell whose value may or may not be present.
-    #[test]
-    fn enriched_cell() {
-        struct Ident;
-
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        struct Derived(u64);
-
-        impl From<&'_ u64> for Derived {
-            fn from(value: &u64) -> Self {
-                Derived(*value)
-            }
-        }
-
-        impl EnrichedValue for Ident {
-            type E = u64;
-
-            type D = Derived;
-        }
-
-        proptest::proptest!(|(initial: Option<u64>)| {
-            let mut cell = arb_to_enriched_cell::<Ident>(initial);
-
-            let stored = handle_stepper_panics(|| cell.read_stored()).ok();
-            proptest::prop_assert_eq!(stored, initial);
-
-            let derived = handle_stepper_panics(|| cell.read_derived()).ok();
-            let expected_derived = initial.as_ref().map(<Ident as EnrichedValueLinked>::derive);
-            proptest::prop_assert_eq!(derived, expected_derived);
-
-            let new_value = rand::random();
-            cell.write(new_value);
-
-            let read_value = cell.read_stored();
-            proptest::prop_assert_eq!(read_value, new_value);
-
-            let new_derived = <Ident as EnrichedValueLinked>::derive(&new_value);
-            let read_derived = cell.read_derived();
-            proptest::prop_assert_eq!(read_derived, new_derived);
-        });
-    }
-
     macro_rules! assert_eq_found {
         ( $left:expr, $right:expr ) => {
             assert!(handle_stepper_panics(|| { $left }).is_ok_and(|v| v == $right))
@@ -750,12 +627,13 @@ mod tests {
     }
 
     macro_rules! assert_not_found {
-        ( $body:expr ) => {
+        ( $body:expr ) => {{
+            let result = handle_stepper_panics(|| $body).expect_err("computation should fail");
             assert!(
-                handle_stepper_panics(|| { $body })
-                    .is_err_and(|e| matches!(e, ProofVerificationFailure::AbsentDataAccess(_)))
-            )
-        };
+                matches!(result, ProofVerificationFailure::AbsentDataAccess(_)),
+                "unexpected error: {result:?}"
+            );
+        }};
     }
 
     /// Check the read functionality of a region that has no gaps between its pages.
@@ -763,7 +641,7 @@ mod tests {
     fn dyn_region_continuous() {
         const LEAF_SIZE: usize = MERKLE_LEAF_SIZE.get();
 
-        let mut dyn_region = DynRegion::default();
+        let mut dyn_region = DynRegion::absent(3 * LEAF_SIZE);
         dyn_region.write_bytes(
             0,
             [1, 3, 3, 7]
@@ -783,44 +661,60 @@ mod tests {
                 .as_slice(),
         );
 
-        let mut dyn_cells: DynCells<{ 3 * LEAF_SIZE }, Verifier> = DynCells::bind(dyn_region);
+        let mut dyn_cells: DynCells<Verifier> = DynCells::bind(dyn_region);
 
         // Read things that are contained in the first leaf.
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(0), [1, 3, 3, 7]);
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(1), [3, 3, 7, 1]);
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 4), [1, 3, 3, 7]);
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(0), [1, 3, 3, 7]);
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(1), [3, 3, 7, 1]);
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 4), [1, 3, 3, 7]);
+        }
 
         // Read things that span the first and second leaf.
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 2), [3, 7, 11, 14]);
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 2), [3, 7, 11, 14]);
+        }
 
         // Read things that are contained in the second leaf.
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE), [11, 14, 14, 15]);
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE + 1), [14, 14, 15, 11]);
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE), [11, 14, 14, 15]);
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE + 1), [14, 14, 15, 11]);
+        }
 
         // Read more than is available.
-        assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE * 3 + 1]>(0));
+        unsafe {
+            assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE * 3 + 1]>(0));
+        }
 
         // Read at an offset that is out of bounds.
-        assert_not_found!(dyn_cells.read::<u8>(LEAF_SIZE * 2));
+        unsafe {
+            assert_not_found!(dyn_cells.read::<u8>(LEAF_SIZE * 2));
+        }
 
         // Write to an index that is out of bounds.
-        assert_not_found!(dyn_cells.clone().write(LEAF_SIZE * 3, 0u8));
+        unsafe {
+            assert_not_found!(dyn_cells.clone().write(LEAF_SIZE * 3, 0u8));
+        }
 
         // Add more to the third leaf.
-        let dyn_cells = handle_stepper_panics(move || {
+        let dyn_cells = handle_stepper_panics(move || unsafe {
             dyn_cells.write(LEAF_SIZE * 2, [255u8, 0]);
             dyn_cells
         })
         .unwrap();
-        assert_eq_found!(dyn_cells.read::<[u8; 6]>(LEAF_SIZE * 2 - 4), [
-            11, 14, 14, 15, 255, 0
-        ]);
-        assert_eq_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE * 2), [255, 0]);
-        assert_not_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE * 2));
-        assert_not_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE * 2 + 2));
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 6]>(LEAF_SIZE * 2 - 4), [
+                11, 14, 14, 15, 255, 0
+            ]);
+            assert_eq_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE * 2), [255, 0]);
+            assert_not_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE * 2));
+            assert_not_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE * 2 + 2));
+        }
 
         // Read at an offset that is out of bounds.
-        assert_not_found!(dyn_cells.read::<u8>(LEAF_SIZE * 3));
+        unsafe {
+            assert_not_found!(dyn_cells.read::<u8>(LEAF_SIZE * 3));
+        }
     }
 
     /// Check the functionality of a region that has gaps between its pages.
@@ -828,7 +722,7 @@ mod tests {
     fn dyn_region_gaps() {
         const LEAF_SIZE: usize = MERKLE_LEAF_SIZE.get();
 
-        let mut dyn_region = DynRegion::default();
+        let mut dyn_region = DynRegion::absent(3 * LEAF_SIZE);
         dyn_region.write_bytes(
             0,
             [7, 3, 3]
@@ -848,29 +742,37 @@ mod tests {
                 .as_slice(),
         );
 
-        let mut dyn_cells: DynCells<{ 3 * LEAF_SIZE }, Verifier> = DynCells::bind(dyn_region);
+        let mut dyn_cells: DynCells<Verifier> = DynCells::bind(dyn_region);
 
-        assert_eq_found!(dyn_cells.read::<[u8; 3]>(0), [7, 3, 3]);
-        assert_eq_found!(dyn_cells.read::<[u8; 2]>(1), [3, 3]);
-        assert_eq_found!(dyn_cells.read::<[u8; 1]>(LEAF_SIZE * 2), [42]);
-        assert_eq_found!(dyn_cells.read::<[u8; 1]>(LEAF_SIZE * 2 + 1), [41]);
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 3]>(0), [7, 3, 3]);
+            assert_eq_found!(dyn_cells.read::<[u8; 2]>(1), [3, 3]);
+            assert_eq_found!(dyn_cells.read::<[u8; 1]>(LEAF_SIZE * 2), [42]);
+            assert_eq_found!(dyn_cells.read::<[u8; 1]>(LEAF_SIZE * 2 + 1), [41]);
+        }
 
         // Read a range that covers a gap.
-        assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE + 4]>(LEAF_SIZE - 2));
-        assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE]>(LEAF_SIZE));
+        unsafe {
+            assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE + 4]>(LEAF_SIZE - 2));
+            assert_not_found!(dyn_cells.read::<[u8; LEAF_SIZE]>(LEAF_SIZE));
+        }
 
         // Write within the gap.
-        let dyn_cells = handle_stepper_panics(move || {
+        let dyn_cells = handle_stepper_panics(move || unsafe {
             dyn_cells.write(LEAF_SIZE - 1, [1u8, 1, 3]);
             dyn_cells
         })
         .unwrap();
 
-        assert_eq_found!(dyn_cells.read::<[u8; 3]>(LEAF_SIZE - 1), [1, 1, 3]);
-        assert_eq_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE), [1, 3]);
-        assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 2), [3, 1, 1, 3]);
+        unsafe {
+            assert_eq_found!(dyn_cells.read::<[u8; 3]>(LEAF_SIZE - 1), [1, 1, 3]);
+            assert_eq_found!(dyn_cells.read::<[u8; 2]>(LEAF_SIZE), [1, 3]);
+            assert_eq_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE - 2), [3, 1, 1, 3]);
+        }
 
-        assert_not_found!(dyn_cells.read::<[u8; 6]>(LEAF_SIZE - 1));
-        assert_not_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE));
+        unsafe {
+            assert_not_found!(dyn_cells.read::<[u8; 6]>(LEAF_SIZE - 1));
+            assert_not_found!(dyn_cells.read::<[u8; 4]>(LEAF_SIZE));
+        }
     }
 }

@@ -2,15 +2,20 @@
 //
 // SPDX-License-Identifier: MIT
 
-mod buddy;
+pub(crate) mod buddy;
 mod config;
+pub(crate) mod listener;
 mod protection;
-mod state;
+pub(crate) mod state;
 
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 
+use listener::MemoryGovernanceListener;
 use tezos_smart_rollup_constants::riscv::SbiError;
 
+use super::page_cache::PageCache;
+use super::page_cache::code_page_entry::CodePageEntry;
 use super::registers::XValue;
 use crate::pvm::linux;
 use crate::state::NewState;
@@ -27,14 +32,11 @@ use crate::state_backend::ProofLayout;
 use crate::state_backend::Ref;
 
 /// Number of bits needed so you can address every byte in a page
-pub const OFFSET_BITS: u64 = 12;
-
-/// Bit mask to keep only the page offset
-pub const OFFSET_MASK: u64 = (1 << OFFSET_BITS) - 1;
+pub const OFFSET_BITS: NonZeroU64 = NonZeroU64::new(12).expect("OFFSET_BITS is non-zero");
 
 /// Size of a page
 pub const PAGE_SIZE: NonZeroU64 = {
-    const PAGE_SIZE: u64 = 1 << OFFSET_BITS;
+    const PAGE_SIZE: u64 = 1 << OFFSET_BITS.get();
 
     // Compile-time check: Page size must be positive
     const _: () = {
@@ -52,11 +54,31 @@ pub const PAGE_SIZE: NonZeroU64 = {
     }
 };
 
+/// Mask for indexing into a page's memory.
+pub const PAGE_OFFSET_MASK: u64 = (1 << OFFSET_BITS.get()) - 1;
+
+/// Mask for obtaining a page-aligned-down address.
+pub const PAGE_MASK: u64 = !0 << OFFSET_BITS.get();
+
 /// Memory address
 pub type Address = XValue;
 
 /// Lowest address
 pub const FIRST_ADDRESS: Address = 0;
+
+/// Convert an address into the page index.
+///
+/// The address will be contained within the page pointed to by this index.
+#[inline]
+pub fn address_to_page_index(address: Address) -> usize {
+    (address >> OFFSET_BITS.get()) as usize
+}
+
+/// Isolate the 'page offset' component of an address.
+#[inline]
+pub fn address_to_page_offset(address: Address) -> usize {
+    (address & PAGE_OFFSET_MASK) as usize
+}
 
 /// Memory access permissions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +251,7 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
         M: ManagerClone;
 
     /// Zero-out all memory.
-    fn reset(&mut self)
+    fn reset(&mut self, listener: impl MemoryGovernanceListener)
     where
         M: ManagerWrite;
 
@@ -237,8 +259,9 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
     fn protect_pages(
         &mut self,
         address: Address,
-        length: usize,
+        length: NonZeroUsize,
         perms: Permissions,
+        listener: impl MemoryGovernanceListener,
     ) -> Result<(), MemoryGovernanceError>
     where
         M: ManagerWrite;
@@ -247,7 +270,7 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
     fn allocate_pages(
         &mut self,
         address_hint: Option<Address>,
-        length: usize,
+        length: NonZeroUsize,
         allow_replace: bool,
     ) -> Result<Address, MemoryGovernanceError>
     where
@@ -257,7 +280,7 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
     fn deallocate_pages(
         &mut self,
         address: Address,
-        length: usize,
+        length: NonZeroUsize,
     ) -> Result<(), MemoryGovernanceError>
     where
         M: ManagerReadWrite;
@@ -266,9 +289,10 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
     fn allocate_and_protect_pages(
         &mut self,
         address_hint: Option<Address>,
-        length: usize,
+        length: NonZeroUsize,
         perms: Permissions,
         allow_replace: bool,
+        listener: impl MemoryGovernanceListener,
     ) -> Result<Address, MemoryGovernanceError>
     where
         M: ManagerReadWrite;
@@ -277,26 +301,30 @@ pub trait Memory<M: ManagerBase>: NewState<M> + Sized {
     fn deallocate_and_protect_pages(
         &mut self,
         address: Address,
-        length: usize,
+        length: NonZeroUsize,
+        listener: impl MemoryGovernanceListener,
     ) -> Result<(), MemoryGovernanceError>
     where
         M: ManagerReadWrite,
     {
         self.deallocate_pages(address, length)?;
-        self.protect_pages(address, length, Permissions::NONE)
+        self.protect_pages(address, length, Permissions::NONE, listener)
     }
 }
 
 /// Memory configuration
-pub trait MemoryConfig: 'static {
+pub trait MemoryConfig: Send + Sync + Sized + 'static {
     /// Number of bytes in the memory
-    const TOTAL_BYTES: usize;
+    const TOTAL_BYTES: NonZeroUsize;
 
     /// Layout for memory instance's state
     type Layout: CommitmentLayout + ProofLayout;
 
     /// Memory instance
     type State<M: ManagerBase>: Memory<M>;
+
+    /// Page Cache instance
+    type PageCache<CPE: CodePageEntry<Self, M>, M: ManagerBase>: PageCache<CPE, Self, M>;
 
     /// Bind the allocated regions to produce a memory instance.
     fn bind<M: ManagerBase>(space: AllocatedOf<Self::Layout, M>) -> Self::State<M>;
@@ -316,5 +344,29 @@ pub use config::M1M;
 pub use config::M4G;
 pub use config::M4K;
 pub use config::M8K;
+pub use config::M16G;
 pub use config::M32G;
+pub use config::M64G;
 pub use config::M64M;
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use crate::machine_state::memory::Address;
+    use crate::machine_state::memory::OFFSET_BITS;
+    use crate::machine_state::memory::PAGE_SIZE;
+
+    #[test]
+    fn split_address_to_page_and_offset() {
+        proptest!(|(address: Address)| {
+            let page_idx = super::address_to_page_index(address);
+            let offset = super::address_to_page_offset(address);
+
+            let original_address = (page_idx as u64) << OFFSET_BITS.get() | (offset as u64);
+
+            prop_assert_eq!(address, original_address);
+            prop_assert!((offset as u64) < PAGE_SIZE.get());
+        });
+    }
+}

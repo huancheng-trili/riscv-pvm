@@ -1,10 +1,17 @@
 # Binary artefacts
-/src/riscv/riscv-sandbox*
 /src/riscv/riscv-dummy.elf
 /src/riscv/riscv-dummy-linux-musl.elf
 
 # Cargo
 target
 
+# Rust LSP
+.rust-analyzer.json
+
 # Direnv
 .direnv
+.envrc
+
+# Profiling outputs
+riscv-sandbox-profile.json
+perf.data

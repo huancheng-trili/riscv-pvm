@@ -10,60 +10,50 @@ use std::ops::Bound;
 use goldenfile::Mint;
 use paste::paste;
 
-use crate::machine_state::block_cache::block::Block;
-use crate::machine_state::block_cache::block::Interpreted;
-use crate::machine_state::block_cache::block::Jitted;
-use crate::machine_state::block_cache::block::dispatch::InlineCompiler;
 use crate::machine_state::memory::M1M;
-use crate::machine_state::registers::XRegister;
-use crate::machine_state::registers::XValue;
-use crate::state_backend::ManagerRead;
+use crate::machine_state::page_cache::CodePageEntry;
+use crate::machine_state::page_cache::InlineCompiler;
+use crate::machine_state::page_cache::Interpreted;
+use crate::machine_state::page_cache::Jitted;
 use crate::state_backend::owned_backend::Owned;
 use crate::stepper::Stepper;
 use crate::stepper::test::TestStepper;
 use crate::stepper::test::TestStepperResult::*;
 
-const TESTS_DIR: &str = "../assets/generated";
+const TESTS_DIR: &str = "../../../assets/generated";
 const GOLDEN_DIR: &str = "tests/expected";
 const MAX_STEPS: usize = 1_000_000;
 
-fn check_register_values<S: Stepper>(stepper: &S, check_xregs: &[(XRegister, XValue)])
-where
-    S::Manager: ManagerRead,
-{
-    let failure = check_xregs
-        .iter()
-        .filter_map(|(xreg, xval)| {
-            let res = stepper.machine_state().hart.xregisters.read(*xreg);
-            (res != *xval).then(|| format!("\n- check {xreg} == {xval} | got {res}"))
-        })
-        .collect::<String>();
-
-    if !failure.is_empty() {
-        panic!("XRegisters conditions not satisfied: {failure}");
-    };
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Permissions {
+    FromProgramHeaders,
+    Rwx,
 }
 
-fn run_test_with_check<B: Block<M1M, Owned>>(
+fn run_test<CPE: CodePageEntry<M1M, Owned>>(
     path: &str,
-    check_xregs: &[(XRegister, u64)],
-    block_builder: B::BlockBuilder,
-) -> B::BlockBuilder {
-    // Create a Mint instance: when it goes out of scope (at the end of interpret_test_with_check),
+    compiler: CPE::Compiler,
+    required_perms: Permissions,
+) -> CPE::Compiler {
+    // Create a Mint instance: when it goes out of scope (at the end of interpret_test),
     // all golden files will be compared to the checked-in versions.
     let mut mint = Mint::new(GOLDEN_DIR);
     let mut golden = mint.new_goldenfile(format!("{path}.out")).unwrap();
 
     let contents = fs::read(format!("{TESTS_DIR}/{path}")).expect("Failed to read binary");
 
-    let mut interpreter: TestStepper<M1M, _, B> =
-        TestStepper::new(&contents, block_builder).expect("Boot failed");
+    let mut interpreter: TestStepper<M1M, CPE> =
+        TestStepper::new(&contents, compiler).expect("Boot failed");
+
+    if required_perms == Permissions::Rwx {
+        interpreter.set_all_read_write_exec();
+    }
 
     let res = interpreter.step_max(Bound::Included(MAX_STEPS));
     // Record the result to compare to the expected result
     writeln!(golden, "{res:?}").unwrap();
     match res {
-        Exit { code: 0, .. } => check_register_values(&interpreter, check_xregs),
+        Exit { code: 0, .. } => {}
         Exit { code, steps } => {
             panic!("Failed at test case: {} - Steps done: {}", code >> 1, steps)
         }
@@ -73,55 +63,53 @@ fn run_test_with_check<B: Block<M1M, Owned>>(
             message,
             steps,
         } => match message {
-            Some(message) => panic!(
-                "Unexpected exception after {steps} steps: {message} (caused by {:?})",
-                cause
-            ),
-            None => panic!("Unexpected exception after {steps} steps: {:?}", cause),
+            Some(message) => {
+                panic!("Unexpected exception after {steps} steps: {message} (caused by {cause:?})")
+            }
+            None => panic!("Unexpected exception after {steps} steps: {cause:?}"),
         },
     };
 
     interpreter.recover_builder()
 }
 
-fn interpret_test_with_check(path: &str, check_xregs: &[(XRegister, u64)]) {
-    let block_builder = Default::default();
-    run_test_with_check::<Interpreted<M1M, Owned>>(path, check_xregs, block_builder);
+fn interpret_test(path: &str, required_perms: Permissions) {
+    let compiler = Default::default();
+    run_test::<Interpreted<M1M, Owned>>(path, compiler, required_perms);
 }
 
 /// For the JIT, we run it twice - the first run to build up the blocks, and the
 /// second to run with these blocks already compiled (so that we actually use them).
-fn inline_jit_test_with_check(path: &str, check_xregs: &[(XRegister, u64)]) {
-    type BlockImpl = Jitted<InlineCompiler<M1M>, M1M>;
+fn inline_jit_test(path: &str, required_perms: Permissions) {
+    type EntrypointImpl = Jitted<InlineCompiler<M1M>, M1M>;
 
-    let block_builder = Default::default();
-    let block_builder = run_test_with_check::<BlockImpl>(path, check_xregs, block_builder);
+    let compiler = Default::default();
+    let compiler = run_test::<EntrypointImpl>(path, compiler, required_perms);
 
-    run_test_with_check::<BlockImpl>(path, check_xregs, block_builder);
+    run_test::<EntrypointImpl>(path, compiler, required_perms);
 }
 
 macro_rules! test_case {
     // Run the test cases without specifying xregisters to check
     ($(#[$m:meta],)* $name: ident, $path: expr) => {
-        test_case!($(#[$m],)* $name, $path, &[]);
+        test_case!($(#[$m],)* $name, $path, Permissions::FromProgramHeaders);
     };
 
-    // Run the test cases, check xregisters
-    ($(#[$m:meta],)* $name: ident, $path: expr, $xchecks: expr) => {
+    ($(#[$m:meta],)* $name: ident, $path: expr, $required_perms: expr) => {
         paste! {
             #[test]
             $(#[$m])*
             fn [< $name _interpreted >]() {
-                interpret_test_with_check($path, $xchecks)
+                interpret_test($path, $required_perms)
             }
 
             #[test]
             $(#[$m])*
             fn [< $name _inline_jit >]() {
-                inline_jit_test_with_check($path, $xchecks)
+                inline_jit_test($path, $required_perms)
             }
         }
-    };
+    }
 }
 
 // RV64-UA
@@ -146,7 +134,7 @@ test_case!(test_suite_rv64ua_p_amoxor_w, "rv64ua-p-amoxor_w");
 test_case!(test_suite_rv64ua_p_lrsc, "rv64ua-p-lrsc");
 
 // RV64-UC
-test_case!(test_suite_rv64uc_p_rvc, "rv64uc-p-rvc");
+test_case!(test_suite_rv64uc_p_rvc, "rv64uc-p-rvc", Permissions::Rwx);
 
 // RV64-UD
 test_case!(test_suite_rv64ud_p_fadd, "rv64ud-p-fadd");
@@ -189,7 +177,11 @@ test_case!(test_suite_rv64ui_p_bgeu, "rv64ui-p-bgeu");
 test_case!(test_suite_rv64ui_p_blt, "rv64ui-p-blt");
 test_case!(test_suite_rv64ui_p_bltu, "rv64ui-p-bltu");
 test_case!(test_suite_rv64ui_p_bne, "rv64ui-p-bne");
-test_case!(test_suite_rv64ui_p_fence_i, "rv64ui-p-fence_i");
+test_case!(
+    test_suite_rv64ui_p_fence_i,
+    "rv64ui-p-fence_i",
+    Permissions::Rwx
+);
 test_case!(test_suite_rv64ui_p_jal, "rv64ui-p-jal");
 test_case!(test_suite_rv64ui_p_jalr, "rv64ui-p-jalr");
 test_case!(test_suite_rv64ui_p_lb, "rv64ui-p-lb");

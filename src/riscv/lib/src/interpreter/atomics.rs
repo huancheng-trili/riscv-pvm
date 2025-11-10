@@ -4,6 +4,7 @@
 
 //! Core logic for atomic instructions
 
+use crate::exceptions::Exception;
 use crate::instruction_context::ICB;
 use crate::instruction_context::Predicate;
 use crate::instruction_context::StoreLoadInt;
@@ -18,7 +19,6 @@ use crate::state_backend::CellProj;
 use crate::state_context::StateContext;
 use crate::state_context::projection::MachineCoreCons;
 use crate::state_context::projection::impl_projection;
-use crate::traps::Exception;
 
 pub const SC_SUCCESS: u64 = 0;
 pub const SC_FAILURE: u64 = 1;
@@ -45,7 +45,8 @@ fn run_x64_atomic<I: ICB>(
     let address_rs1 = read_xregister(icb, rs1);
 
     // Handle the case where the address is not aligned.
-    let result = icb.atomic_access_fault_guard::<u64>(address_rs1, ReservationSetOption::NoReset);
+    let result =
+        atomic_access_fault_guard::<u64, I>(icb, address_rs1, ReservationSetOption::NoReset);
 
     // Continue with the operation if the address is aligned.
     let val_rs1_result = I::and_then(result, |_| icb.main_memory_load::<u64>(address_rs1));
@@ -74,7 +75,8 @@ fn run_x32_atomic<I: ICB>(
     let address_rs1 = read_xregister(icb, rs1);
 
     // Handle the case where the address is not aligned.
-    let result = icb.atomic_access_fault_guard::<u32>(address_rs1, ReservationSetOption::NoReset);
+    let result =
+        atomic_access_fault_guard::<u32, I>(icb, address_rs1, ReservationSetOption::NoReset);
 
     // Continue with the operation if the address is aligned.
     let val_rs1_result = I::and_then(result, |_| icb.main_memory_load::<u32>(address_rs1));
@@ -380,7 +382,7 @@ pub(super) fn run_atomic_load<I: ICB, V: StoreLoadInt>(
     // 64-bit words and four-byte aligned for 32-bit words). If the address
     // is not naturally aligned, an address-misaligned exception or
     // an access-fault exception will be generated."
-    let result = icb.atomic_access_fault_guard::<V>(address_rs1, ReservationSetOption::NoReset);
+    let result = atomic_access_fault_guard::<V, I>(icb, address_rs1, ReservationSetOption::NoReset);
 
     // Continue with the operation if the address is aligned and load the value from address in rs1.
     let val_rs1_result = I::and_then(result, |_| icb.main_memory_load::<V>(address_rs1));
@@ -418,12 +420,12 @@ pub(super) fn run_atomic_store<I: ICB, V: StoreLoadInt>(
     // is not naturally aligned, an address-misaligned exception or
     // an access-fault exception will be generated."
     // icb.reset_reservation_set();
-    let result = icb.atomic_access_fault_guard::<V>(address_rs1, ReservationSetOption::Reset);
+    let result = atomic_access_fault_guard::<V, I>(icb, address_rs1, ReservationSetOption::Reset);
 
     I::and_then(result, |_| {
         let cond = test_and_unset_reservation_set::<V, I>(icb, address_rs1);
 
-        icb.branch_merge::<Result<(), Exception>, _, _>(
+        icb.if_then_else::<Result<(), Exception>, _, _>(
             cond,
             |icb| {
                 // If the address in rs1 belongs to a valid reservation, write
@@ -466,7 +468,7 @@ pub fn run_atomic_swap<I: ICB, V: StoreLoadInt>(
     // 64-bit words and four-byte aligned for 32-bit words). If the address
     // is not naturally aligned, an address-misaligned exception or
     // an access-fault exception will be generated."
-    let result = icb.atomic_access_fault_guard::<V>(address_rs1, ReservationSetOption::NoReset);
+    let result = atomic_access_fault_guard::<V, I>(icb, address_rs1, ReservationSetOption::NoReset);
 
     // Continue with the operation if the address is aligned.
     let val_rs1_result = I::and_then(result, |_| icb.main_memory_load::<V>(address_rs1));
@@ -593,7 +595,35 @@ pub fn run_x64_atomic_store<I: ICB>(
     run_atomic_store::<I, i64>(icb, rs1, rs2, rd)
 }
 
-// Reservation Set Helper Functionss
+// Reservation Set Helper Functions
+
+/// Raise an [`Exception::StoreAMOAccessFault`] error if `address` is not aligned to the width
+/// encoded by `V`.
+#[inline]
+fn atomic_access_fault_guard<V: StoreLoadInt, I: ICB>(
+    icb: &mut I,
+    address: I::XValue,
+    reservation_set_option: ReservationSetOption,
+) -> I::IResult<()> {
+    let width = icb.xvalue_of_imm(V::WIDTH as i64);
+    let remainder = address.modulus_unsigned(width, icb);
+
+    // The steps of taking the comparison are technically not needed, as cranelift will
+    // treat any non-zero value as a take-branch (i.e. raise exception) value, so we could
+    // pass the remainder directly. However for completeness and clarity, we are keeping the
+    // comparison here.
+    let zero = icb.xvalue_of_imm(0);
+    let not_aligned = remainder.compare(zero, Predicate::NotEqual, icb);
+
+    icb.if_then(not_aligned, |icb| {
+        if let ReservationSetOption::Reset = reservation_set_option {
+            // If the atomic operation was a store_conditional, we reset the reservation.
+            reset_reservation_set(icb);
+        }
+
+        icb.raise_exception(Exception::StoreAMOAccessFault)
+    })
+}
 
 /// Reset the reservation set to an unset state.
 pub(crate) fn reset_reservation_set<I: ICB>(icb: &mut I) {
@@ -641,12 +671,12 @@ impl_projection! {
 }
 
 /// Read the reservation set address from the machine state.
-pub(crate) fn read_reservation_set<SC: StateContext>(state: &mut SC) -> SC::X64 {
+pub(crate) fn read_reservation_set<SC: StateContext>(state: &mut SC) -> SC::Value<u64> {
     state.read_proj::<ReservationSetProj>(())
 }
 
 /// Write to the reservation set address in the machine state.
-pub(crate) fn write_reservation_set<SC: StateContext>(state: &mut SC, value: SC::X64) {
+pub(crate) fn write_reservation_set<SC: StateContext>(state: &mut SC, value: SC::Value<u64>) {
     state.write_proj::<ReservationSetProj>((), value);
 }
 
@@ -663,6 +693,7 @@ pub(crate) mod test {
     use crate::interpreter::integer::run_addi;
     use crate::machine_state::MachineCoreState;
     use crate::machine_state::memory::M4K;
+    use crate::machine_state::memory::listener::NoopMemoryGovernanceListener;
     use crate::machine_state::registers::a0;
     use crate::machine_state::registers::a1;
     use crate::machine_state::registers::a2;
@@ -686,8 +717,8 @@ pub(crate) mod test {
                     imm in any::<i64>(),
                 )| {
                     let mut state = state_cell.borrow_mut();
-                    state.reset();
-                    state.main_memory.set_all_readable_writeable();
+                    state.reset(NoopMemoryGovernanceListener);
+                    state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
                     state.hart.xregisters.write(a0, r1_addr);
                     state.write_to_bus(0, a0, r1_val)?;
@@ -732,8 +763,8 @@ pub(crate) mod test {
                     r2_val in any::<u64>(),
                 )| {
                     let mut state = state_cell.borrow_mut();
-                    state.reset();
-                    state.main_memory.set_all_readable_writeable();
+                    state.reset(NoopMemoryGovernanceListener);
+                    state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
                     state.hart.xregisters.write(a0, r1_addr);
                     state.write_to_bus(0, a0, r1_val)?;
@@ -934,7 +965,9 @@ pub(crate) mod test {
 
     backend_test!(test_alignment, F, {
         let mut state = MachineCoreState::<M4K, F>::new();
-        state.main_memory.set_all_readable_writeable();
+        state
+            .main_memory
+            .set_all_readable_writeable(NoopMemoryGovernanceListener);
         state.hart.xregisters.write(a0, 80); // LR.D starting address.
         state.hart.xregisters.write(a1, 84); // SC.W starting address.
         state.hart.xregisters.write(a2, 200); // Value to store.

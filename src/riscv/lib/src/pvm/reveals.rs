@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use perfect_derive::perfect_derive;
 use tezos_smart_rollup_constants::riscv::REVEAL_REQUEST_MAX_SIZE;
 
 use crate::state::NewState;
@@ -13,17 +14,17 @@ use crate::state_backend::DynCells;
 use crate::state_backend::FnManager;
 use crate::state_backend::ManagerAlloc;
 use crate::state_backend::ManagerBase;
-use crate::state_backend::ManagerClone;
 use crate::state_backend::ManagerRead;
 use crate::state_backend::Ref;
 
 /// Reveal request layout
-pub type RevealRequestLayout = (DynArray<REVEAL_REQUEST_MAX_SIZE>, Atom<u64>);
+pub type RevealRequestLayout = (DynArray, Atom<u64>);
 
 /// Request content of reveal
+#[perfect_derive(Clone)]
 pub struct RevealRequest<M: ManagerBase> {
     /// Reveal request payload
-    pub bytes: DynCells<REVEAL_REQUEST_MAX_SIZE, M>,
+    pub bytes: DynCells<M>,
     /// Size of reveal request payload
     pub size: Cell<u64, M>,
 }
@@ -65,17 +66,8 @@ impl<M: ManagerBase> NewState<M> for RevealRequest<M> {
         M: ManagerAlloc,
     {
         Self {
-            bytes: DynCells::new(),
+            bytes: DynCells::new(REVEAL_REQUEST_MAX_SIZE),
             size: Cell::new(),
-        }
-    }
-}
-
-impl<M: ManagerClone> Clone for RevealRequest<M> {
-    fn clone(&self) -> Self {
-        Self {
-            bytes: self.bytes.clone(),
-            size: self.size.clone(),
         }
     }
 }

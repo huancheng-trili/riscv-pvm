@@ -13,8 +13,12 @@ pub(crate) mod signals;
 
 use std::convert::Infallible;
 use std::ffi::CStr;
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::ops::Range;
 
+use parameters::SystemCallResultExecution;
+use perfect_derive::perfect_derive;
 use tezos_smart_rollup_constants::riscv::SBI_FIRMWARE_TEZOS;
 
 use self::addr::VirtAddr;
@@ -24,16 +28,18 @@ use super::Pvm;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::MachineError;
 use crate::machine_state::MachineState;
-use crate::machine_state::block_cache::BlockCacheConfig;
-use crate::machine_state::block_cache::block::Block;
+use crate::machine_state::ProgramCounterUpdate;
 use crate::machine_state::memory::Address;
 use crate::machine_state::memory::Memory;
 use crate::machine_state::memory::MemoryConfig;
 use crate::machine_state::memory::PAGE_SIZE;
 use crate::machine_state::memory::Permissions;
+use crate::machine_state::page_cache::code_page_entry::CodePageEntry;
 use crate::machine_state::registers;
 use crate::program::Program;
 use crate::pvm::hooks::PvmHooks;
+use crate::pvm::linux::parameters::ECALL_WIDTH;
+use crate::pvm::linux::signals::Signal;
 use crate::state::NewState;
 use crate::state_backend::AllocatedOf;
 use crate::state_backend::Atom;
@@ -41,7 +47,6 @@ use crate::state_backend::Cell;
 use crate::state_backend::FnManager;
 use crate::state_backend::ManagerAlloc;
 use crate::state_backend::ManagerBase;
-use crate::state_backend::ManagerClone;
 use crate::state_backend::ManagerRead;
 use crate::state_backend::ManagerReadWrite;
 use crate::state_backend::ManagerWrite;
@@ -114,6 +119,9 @@ const RT_SIGACTION: u64 = 134;
 /// System call number for `rt_sigprocmask` on RISC-V
 const RT_SIGPROCMASK: u64 = 135;
 
+/// System call number for `rt_sigreturn` on RISC-V
+const RT_SIGRETURN: u64 = 139;
+
 /// System call number for `getpid` on RISC-V
 const GETPID: u64 = 172;
 
@@ -164,9 +172,7 @@ enum AuxVectorKey {
     ProgramHeadersPtr = 3,
 }
 
-impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: Block<MC, M>, M: ManagerBase>
-    MachineState<MC, BCC, B, M>
-{
+impl<MC: MemoryConfig, CPE: CodePageEntry<MC, M>, M: ManagerBase> MachineState<MC, CPE, M> {
     /// Add data to the stack, returning the updated stack pointer.
     fn push_stack(&mut self, align: u64, data: impl AsRef<[u8]>) -> Result<Address, MachineError>
     where
@@ -241,11 +247,10 @@ impl<MC: MemoryConfig, BCC: BlockCacheConfig, B: Block<MC, M>, M: ManagerBase>
     }
 }
 
-impl<MC, BCC, B, M> Pvm<MC, BCC, B, M>
+impl<MC, CPE, M> Pvm<MC, CPE, M>
 where
     MC: MemoryConfig,
-    BCC: BlockCacheConfig,
-    B: Block<MC, M>,
+    CPE: CodePageEntry<MC, M>,
     M: ManagerBase,
 {
     /// Load the program into memory and set the PC to its entrypoint.
@@ -256,44 +261,7 @@ where
         // Reset hart state & set pc to entrypoint
         self.machine_state.core.hart.reset(program.entrypoint);
 
-        let program_start = program.segments.keys().min().copied().unwrap_or(0);
-        let program_end = program
-            .segments
-            .iter()
-            .map(|(addr, data)| addr.saturating_add(data.len() as u64))
-            .max()
-            .unwrap_or(0);
-        let program_length = program_end.saturating_sub(program_start) as usize;
-
-        // Allow the program to be written to main memory
-        self.machine_state.core.main_memory.protect_pages(
-            program_start,
-            program_length,
-            Permissions::WRITE,
-        )?;
-
-        // Write program to main memory
-        for (&addr, data) in program.segments.iter() {
-            self.machine_state.core.main_memory.write_all(addr, data)?;
-        }
-
-        // Remove access to the program that has just been placed into memory
-        self.machine_state.core.main_memory.protect_pages(
-            program_start,
-            program_length,
-            Permissions::NONE,
-        )?;
-
-        // Configure memory permissions using the ELF program headers, if present
-        if let Some(program_headers) = &program.program_headers {
-            for mem_perms in program_headers.permissions.iter() {
-                self.machine_state.core.main_memory.protect_pages(
-                    mem_perms.start_address,
-                    mem_perms.length as usize,
-                    mem_perms.permissions,
-                )?;
-            }
-        }
+        let (program_start, program_end) = self.machine_state.setup_boot_program(program)?;
 
         // Other parts of the supervisor make use of program start and end to properly divide the
         // memory. These addresses need to be properly aligned.
@@ -311,7 +279,7 @@ where
     where
         M: ManagerReadWrite,
     {
-        let stack_top = VirtAddr::new(MC::TOTAL_BYTES as u64);
+        let stack_top = VirtAddr::new(MC::TOTAL_BYTES.get() as u64);
 
         // We must fit at least one guard page between the program break and the stack
         let guarded_stack_space = stack_top - self.system_state.program.end;
@@ -330,24 +298,31 @@ where
             return Err(MachineError::MemoryTooSmall);
         }
 
-        // At this point we know that `stack_top` >= `stack_bottom`
-        let stack_space = (stack_top - stack_bottom) as usize;
-
         // Guard the stack with a guard page. This prevents stack overflows spilling into the heap
         // or even worse, the program's .bss or .data area.
         let stack_guard = stack_bottom - PAGE_SIZE.get();
-        self.machine_state.core.main_memory.protect_pages(
-            stack_guard.to_machine_address(),
-            PAGE_SIZE.get() as usize,
-            Permissions::NONE,
-        )?;
 
-        // Make sure the stack region is readable and writable
-        self.machine_state.core.main_memory.protect_pages(
-            stack_bottom.to_machine_address(),
-            stack_space,
-            Permissions::READ_WRITE,
-        )?;
+        // At this point we know that `stack_top` >= `stack_bottom`
+        let stack_space = (stack_top - stack_bottom) as usize;
+        if let Some(stack_space) = NonZeroUsize::new(stack_space) {
+            let (main_memory, mut listener) = self.machine_state.memory_with_listener();
+
+            main_memory.protect_pages(
+                stack_guard.to_machine_address(),
+                // TODO: RV-561: use u64 everywhere in the PVM
+                PAGE_SIZE.try_into().expect("`PAGE_SIZE` fits into usize"),
+                Permissions::NONE,
+                &mut listener,
+            )?;
+
+            // Make sure the stack region is readable and writable
+            main_memory.protect_pages(
+                stack_bottom.to_machine_address(),
+                stack_space,
+                Permissions::READ_WRITE,
+                listener,
+            )?;
+        }
 
         self.machine_state
             .core
@@ -395,7 +370,14 @@ where
 
         // Setup heap addresses
         let program_end = self.system_state.program.end;
-        let heap_start = program_end
+
+        let restorer_start = program_end
+            .align_up(PAGE_SIZE)
+            .ok_or(MachineError::MemoryTooSmall)?;
+
+        let restorer_end = self.write_restorer(restorer_start)?;
+
+        let heap_start = restorer_end
             .align_up(PAGE_SIZE)
             .ok_or(MachineError::MemoryTooSmall)?;
 
@@ -411,10 +393,13 @@ where
             .allocate_pages(Some(0), MC::TOTAL_BYTES, true)?;
 
         // Make sure only the heap can be used for allocation by the user kernel.
-        self.machine_state.core.main_memory.deallocate_pages(
-            self.system_state.heap.start.to_machine_address(),
-            (self.system_state.heap.end - self.system_state.heap.start) as usize,
-        )?;
+        let heap_size = (self.system_state.heap.end - self.system_state.heap.start) as usize;
+        if let Some(heap_size) = NonZeroUsize::new(heap_size) {
+            self.machine_state
+                .core
+                .main_memory
+                .deallocate_pages(self.system_state.heap.start.to_machine_address(), heap_size)?;
+        }
 
         Ok(())
     }
@@ -447,6 +432,7 @@ struct_layout! {
 }
 
 /// Linux supervisor state
+#[perfect_derive(Clone)]
 pub struct SupervisorState<M: ManagerBase> {
     /// Thread lock address
     tid_address: Cell<VirtAddr, M>,
@@ -509,22 +495,18 @@ impl<M: ManagerBase> SupervisorState<M> {
     }
 
     /// Handle a Linux system call.
-    pub fn handle_system_call<MC, BCC, B>(
+    pub fn handle_system_call<MC, CPE>(
         &mut self,
-        machine: &mut MachineState<MC, BCC, B, M>,
+        machine: &mut MachineState<MC, CPE, M>,
         hooks: impl PvmHooks,
-        on_tezos: impl FnOnce(&mut MachineCoreState<MC, M>) -> bool,
-    ) -> bool
+        on_tezos: impl FnOnce(&mut MachineCoreState<MC, M>) -> ControlFlow<()>,
+    ) -> ControlFlow<()>
     where
         MC: MemoryConfig,
-        BCC: BlockCacheConfig,
-        B: Block<MC, M>,
+        CPE: CodePageEntry<MC, M>,
         M: ManagerReadWrite,
     {
-        // We need to jump to the next instruction. The ECall instruction which triggered this
-        // function is 4 byte wide.
-        let pc = machine.core.hart.pc.read().saturating_add(4);
-        machine.core.hart.pc.write(pc);
+        let pc = machine.core.hart.pc.read();
 
         /// Read an argument from a register and interpret it as a system call argument.
         /// If that fails, log the failure.
@@ -562,10 +544,7 @@ impl<M: ManagerBase> SupervisorState<M> {
         /// Check the result of a system call. If it failed, log the error.
         macro_rules! check_result {
             ($system_call:ident, $result:expr) => {{
-                let parameters::SystemCallResultExecution {
-                    result,
-                    control_flow,
-                } = $result
+                let res: SystemCallResultExecution = $result
                     .inspect(|res| {
                         crate::log::trace! {
                             result = format!("{res:?}"),
@@ -582,8 +561,7 @@ impl<M: ManagerBase> SupervisorState<M> {
                         }
                     })?
                     .into();
-                machine.core.hart.xregisters.write(registers::a0, result);
-                control_flow
+                res
             }};
         }
 
@@ -759,10 +737,11 @@ impl<M: ManagerBase> SupervisorState<M> {
             SIGALTSTACK => dispatch2!(sigaltstack, &mut machine.core),
             RT_SIGACTION => dispatch4!(rt_sigaction, &mut machine.core),
             RT_SIGPROCMASK => dispatch4!(rt_sigprocmask, &mut machine.core),
+            RT_SIGRETURN => dispatch0!(rt_sigreturn, &mut machine.core),
             BRK => dispatch0!(brk),
-            MMAP => dispatch6!(mmap, &mut machine.core),
-            MPROTECT => dispatch3!(mprotect, &mut machine.core),
-            MUNMAP => dispatch2!(munmap, &mut machine.core),
+            MMAP => dispatch6!(mmap, machine),
+            MPROTECT => dispatch3!(mprotect, machine),
+            MUNMAP => dispatch2!(munmap, machine),
             MADVISE => dispatch0!(madvise),
             GETRANDOM => dispatch2!(getrandom, &mut machine.core),
             CLOCK_GETTIME => dispatch2!(clock_gettime, &mut machine.core),
@@ -780,16 +759,32 @@ impl<M: ManagerBase> SupervisorState<M> {
                     .hart
                     .xregisters
                     .write_system_call_error(Error::NoSystemCall);
-                false
+
+                machine
+                    .core
+                    .update_pc(pc, ProgramCounterUpdate::Next(ECALL_WIDTH));
+                let _ = machine.core.dispatch_signal(Signal::Sigsys);
             }
 
             Err(error) => {
                 machine.core.hart.xregisters.write_system_call_error(error);
-                true
+                machine
+                    .core
+                    .update_pc(pc, ProgramCounterUpdate::Next(ECALL_WIDTH));
             }
 
-            Ok(continue_eval) => continue_eval,
+            Ok(SystemCallResultExecution {
+                result,
+                control_flow,
+                pc_update,
+            }) => {
+                machine.core.hart.xregisters.write(registers::a0, result);
+                machine.core.update_pc(pc, pc_update);
+                return control_flow;
+            }
         }
+
+        ControlFlow::Continue(())
     }
 
     /// Handle `set_tid_address` system call.
@@ -842,7 +837,8 @@ impl<M: ManagerBase> SupervisorState<M> {
 
         Ok(parameters::SystemCallResultExecution {
             result: status.exit_code(),
-            control_flow: false,
+            control_flow: ControlFlow::Break(()),
+            pc_update: ProgramCounterUpdate::Next(ECALL_WIDTH), // vacuous, never used
         })
     }
 
@@ -851,7 +847,7 @@ impl<M: ManagerBase> SupervisorState<M> {
     fn handle_tkill(
         &mut self,
         _: parameters::MainThreadId,
-        signal: signals::Signal,
+        signal: signals::TkillSignal,
     ) -> Result<parameters::SystemCallResultExecution, Infallible>
     where
         M: ManagerReadWrite,
@@ -860,10 +856,10 @@ impl<M: ManagerBase> SupervisorState<M> {
         self.exited = true;
         self.exit_code = signal.exit_code();
 
-        // Return 0 as an indicator of success, even if this might not actually be used
         Ok(parameters::SystemCallResultExecution {
-            result: 0,
-            control_flow: false,
+            control_flow: ControlFlow::Break(()),
+            result: 0, // indicator of success, even if this might not actually be used
+            ..SystemCallResultExecution::default()  // vacuous args, never used
         })
     }
 
@@ -981,15 +977,13 @@ impl<M: ManagerBase> SupervisorState<M> {
         // In jstz this is only used to set the maximum size of the process stack to infinity. In
         // other programs, it can be used to set limits for system resources. Allowing programs to
         // set these values to extreme values would inflate proof size, so is undesirable.
-        // Futhermore, a privileged process (such as the supervisor implemented in this PVM) has
+        // Furthermore, a privileged process (such as the supervisor implemented in this PVM) has
         // the ability to set these limits to arbitrary values.
         // So it does! By using its own predefined limits and returning EPERM.
 
         struct MemorySize<MC>(MC);
         impl<MC: MemoryConfig> MemorySize<MC> {
-            const SIZE: u64 = MC::TOTAL_BYTES as u64;
-
-            const UPPER_BOUND: () = assert!(MC::TOTAL_BYTES <= u64::MAX as usize);
+            const SIZE: u64 = MC::TOTAL_BYTES.get() as u64;
 
             // Hard limit on the size of the data segment
             const RLIMIT_DATA: u64 = Self::SIZE;
@@ -1003,8 +997,6 @@ impl<M: ManagerBase> SupervisorState<M> {
             // Hard limit on the size of a process's virtual memory (B)
             const RLIMIT_AS: u64 = Self::SIZE;
         }
-
-        let () = MemorySize::<MC>::UPPER_BOUND;
 
         // If new_limit is not NULL, the system call is being used to write new limits, so ignore
         // it and return a permissions error
@@ -1047,23 +1039,17 @@ impl<M: ManagerBase> SupervisorState<M> {
     }
 }
 
-impl<M: ManagerClone> Clone for SupervisorState<M> {
-    fn clone(&self) -> Self {
-        Self {
-            tid_address: self.tid_address.clone(),
-            exited: self.exited,
-            exit_code: self.exit_code,
-            program: self.program.clone(),
-            stack_guard: self.stack_guard.clone(),
-            heap: self.heap.clone(),
-        }
+impl<M: ManagerAlloc> Default for SupervisorState<M> {
+    fn default() -> Self {
+        SupervisorState::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::array;
     use std::num::NonZeroU64;
+    use std::ops::Bound;
+    use std::ops::ControlFlow;
 
     use rand::Rng;
 
@@ -1073,17 +1059,21 @@ mod tests {
     use super::parameters::Visibility;
     use super::*;
     use crate::backend_test;
-    use crate::machine_state::block_cache::DefaultCacheConfig;
-    use crate::machine_state::block_cache::block::Interpreted;
-    use crate::machine_state::block_cache::block::InterpretedBlockBuilder;
     use crate::machine_state::memory::M4K;
+    use crate::machine_state::page_cache::Interpreted;
+    use crate::machine_state::page_cache::InterpretedCompiler;
+    use crate::machine_state::registers::sp;
+    use crate::parser::instruction::InstrWidth;
     use crate::pvm::hooks::StdoutDebugHooks;
     use crate::pvm::linux::error::Error;
     use crate::pvm::linux::parameters::NoFileDescriptor;
     use crate::pvm::linux::parameters::Zero;
+    use crate::pvm::linux::registers::XValue;
+    use crate::pvm::linux::registers::a0;
+    use crate::pvm::linux::signals::Signal;
 
     /// Default handler for the `on_tezos` parameter of [`SupervisorState::handle_system_call`]
-    fn default_on_tezos_handler<MC, M>(core: &mut MachineCoreState<MC, M>) -> bool
+    fn default_on_tezos_handler<MC, M>(core: &mut MachineCoreState<MC, M>) -> ControlFlow<()>
     where
         MC: MemoryConfig,
         M: ManagerWrite,
@@ -1091,18 +1081,16 @@ mod tests {
         core.hart
             .xregisters
             .write_system_call_error(Error::NoSystemCall);
-        true
+        ControlFlow::Continue(())
     }
 
     // Check that the `set_tid_address` system call is working correctly.
     backend_test!(set_tid_address, F, {
         type MemLayout = M4K;
-        const MEM_BYTES: usize = MemLayout::TOTAL_BYTES;
+        const MEM_BYTES: usize = MemLayout::TOTAL_BYTES.get();
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::<F>::new();
 
         machine_state
@@ -1123,7 +1111,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
 
         assert_eq!(supervisor_state.tid_address.read(), tid_address);
     });
@@ -1133,17 +1121,11 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         machine_state.reset();
 
         // Make sure everything is readable and writable. Otherwise, we'd get access faults.
-        machine_state
-            .core
-            .main_memory
-            .protect_pages(0, MemLayout::TOTAL_BYTES, Permissions::READ_WRITE)
-            .unwrap();
+        machine_state.set_all_readable_writeable();
 
         for fd in [0i32, 1, 2] {
             let mut supervisor_state = SupervisorState::<F>::new();
@@ -1184,7 +1166,7 @@ mod tests {
                 StdoutDebugHooks,
                 default_on_tezos_handler,
             );
-            assert!(result);
+            assert!(result.is_continue());
 
             let ret = machine_state.core.hart.xregisters.read(registers::a0);
             assert_eq!(ret, 0);
@@ -1198,76 +1180,234 @@ mod tests {
         }
     });
 
-    // Check that the `rt_sigaction` system call is working correctly for a basic case.
-    backend_test!(rt_sigaction_no_handler, F, {
+    // Check that the `rt_sigaction` system call is working correctly for basic cases.
+    backend_test!(rt_sigaction_with_handler, F, {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         machine_state.reset();
 
         // Make sure everything is readable and writable. Otherwise, we'd get access faults.
-        machine_state
-            .core
-            .main_memory
-            .protect_pages(0, MemLayout::TOTAL_BYTES, Permissions::READ_WRITE)
-            .unwrap();
+        machine_state.set_all_readable_writeable();
 
         let mut supervisor_state = SupervisorState::<F>::new();
 
-        // System call number
-        machine_state
-            .core
-            .hart
-            .xregisters
-            .write(registers::a7, RT_SIGACTION);
+        // The handler being stored will be written to this address
+        let action = VirtAddr::new(0x20);
 
-        // Signal is SIGPIPE
-        machine_state
-            .core
-            .hart
-            .xregisters
-            .write(registers::a0, 13i32 as u64);
+        // The old handler will be written to this address
+        let old = VirtAddr::new(0x40);
 
-        // New handler is located at this address
-        machine_state
-            .core
-            .hart
-            .xregisters
-            .write(registers::a1, 0x20);
-
-        // Old handler will be written to this address
-        machine_state
-            .core
-            .hart
-            .xregisters
-            .write(registers::a2, 0x40);
+        let linux_sig_action = signals::LinuxSigAction::new(VirtAddr::new(0x60));
         machine_state
             .core
             .main_memory
-            .write(0x40, array::from_fn::<u8, 32, _>(|i| i as u8))
+            .write::<signals::LinuxSigAction>(action.to_machine_address(), linux_sig_action.clone())
             .unwrap();
 
-        // Size of sigset_t
-        machine_state.core.hart.xregisters.write(registers::a3, 8);
+        let mut do_sigaction = |signal: u64,
+                                action: VirtAddr,
+                                old: VirtAddr|
+         -> Result<signals::LinuxSigAction, XValue> {
+            // System call number
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a7, RT_SIGACTION);
 
-        // Perform the system call
-        let result = supervisor_state.handle_system_call(
-            &mut machine_state,
-            StdoutDebugHooks,
-            default_on_tezos_handler,
+            // Signum
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a0, signal);
+
+            // New handler is located at this address
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a1, action.to_machine_address());
+
+            // Old handler will be located at this address
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a2, old.to_machine_address());
+
+            // Size of sigset_t
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a3, signals::SIGSET_SIZE);
+
+            // Perform the system call
+            let result = supervisor_state.handle_system_call(
+                &mut machine_state,
+                StdoutDebugHooks,
+                default_on_tezos_handler,
+            );
+            assert!(result.is_continue());
+
+            let error = machine_state.core.hart.xregisters.read(a0);
+            if error != 0 {
+                return Err(error);
+            }
+
+            // Return the value stored in the old handler
+            Ok(machine_state
+                .core
+                .main_memory
+                .read::<signals::LinuxSigAction>(old.to_machine_address())
+                .unwrap())
+        };
+
+        const SIGPIPE: u64 = Signal::Sigpipe as u64;
+        const SIGUSR1: u64 = Signal::Sigusr1 as u64;
+        const SIGKILL: u64 = Signal::Sigkill as u64;
+        const SIGSTOP: u64 = Signal::Sigstop as u64;
+        let nullptr = signals::LinuxSigAction::new(VirtAddr::new(0x0));
+
+        // The sigactions are initialised to zero
+        // Check that the location of the old handler is zeroed out
+        assert_eq!(do_sigaction(SIGPIPE, action, old).unwrap(), nullptr);
+        assert_eq!(do_sigaction(SIGUSR1, action, old).unwrap(), nullptr);
+
+        // Then check that the new handlers can be read independently
+        // SIGUSR1[linux_sigaction], SIPIPE[linux_sigaction]
+        assert_eq!(
+            do_sigaction(SIGUSR1, old, action).unwrap(),
+            linux_sig_action
         );
-        assert!(result);
+        // SIGUSR1[nullptr], SIPIPE[linux_sigaction]
+        assert_eq!(do_sigaction(SIGUSR1, old, action).unwrap(), nullptr);
+        // SIGUSR1[nullptr], SIPIPE[linux_sigaction]
+        assert_eq!(
+            do_sigaction(SIGPIPE, old, action).unwrap(),
+            linux_sig_action
+        );
+        // SIGUSR1[nullptr], SIPIPE[nullptr]
+        assert_eq!(do_sigaction(SIGPIPE, old, action).unwrap(), nullptr);
 
-        // Check if the location where the old handler was is now zeroed out
-        let old_action = machine_state
-            .core
-            .main_memory
-            .read::<[u8; 32]>(0x40)
-            .unwrap();
-        assert_eq!(old_action, [0u8; 32]);
+        // These signals can't have their handling changed
+        assert_eq!(
+            do_sigaction(SIGKILL, action, old),
+            Err(Error::InvalidArgument.into_xvalue())
+        );
+        assert_eq!(
+            do_sigaction(SIGSTOP, action, old),
+            Err(Error::InvalidArgument.into_xvalue())
+        );
+    });
+
+    // Check that the `rt_sigaction` system call can set the disposition to ignore
+    backend_test!(rt_sigaction_ignore, F, {
+        type MemLayout = M4K;
+
+        let mut machine_state =
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
+        machine_state.reset();
+
+        // Make sure everything is readable and writable. Otherwise, we'd get access faults.
+        machine_state.set_all_readable_writeable();
+
+        let mut supervisor_state = SupervisorState::<F>::new();
+
+        let mut do_ignore = |signal: Signal| {
+            // Write the initial stack pointer and program counter.
+            let stack_top = M4K::TOTAL_BYTES.get() as u64;
+            machine_state.core.hart.xregisters.write(sp, stack_top);
+            let init_pc = 0;
+            machine_state.core.hart.pc.write(init_pc);
+
+            let ignore = signals::LinuxSigAction::new(signals::SIG_IGN);
+            let nullptr = VirtAddr::new(0x0);
+            let action = VirtAddr::new(0x100);
+
+            machine_state
+                .core
+                .main_memory
+                .write::<signals::LinuxSigAction>(action.to_machine_address(), ignore.clone())
+                .unwrap();
+
+            // System call number
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a7, RT_SIGACTION);
+
+            // Signum
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a0, signal as u64);
+
+            // New handler is located at this address
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a1, action.to_machine_address());
+
+            // Old handler is nullptr
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a2, nullptr.to_machine_address());
+
+            // Size of sigset_t
+            machine_state
+                .core
+                .hart
+                .xregisters
+                .write(registers::a3, signals::SIGSET_SIZE);
+
+            // Perform the system call
+            let result = supervisor_state.handle_system_call(
+                &mut machine_state,
+                StdoutDebugHooks,
+                default_on_tezos_handler,
+            );
+            assert!(result.is_continue());
+
+            // Cause the [`Exception::IllegalInstruction`].
+            // `unimp`, an illegal instruction.
+            const UNIMPLEMENTED: u32 = 0b_0000;
+
+            machine_state
+                .core
+                .main_memory
+                .write_instruction_unchecked(init_pc, UNIMPLEMENTED)
+                .unwrap();
+
+            machine_state
+                .step_max_handle::<Infallible>(Bound::Included(1), |_| ControlFlow::Continue(()));
+
+            // Check that the program counter increased
+            assert_eq!(
+                machine_state.core.hart.pc.read(),
+                init_pc + InstrWidth::Uncompressed as u64
+            );
+        };
+
+        do_ignore(Signal::Sigill);
+        do_ignore(Signal::Sigabrt);
+        do_ignore(Signal::Sigiot);
+        do_ignore(Signal::Sigbus);
+        do_ignore(Signal::Sigfpe);
+        do_ignore(Signal::Sigusr1);
+        do_ignore(Signal::Sigsegv);
+        do_ignore(Signal::Sigusr2);
+        do_ignore(Signal::Sigpipe);
+        do_ignore(Signal::Sigterm);
+        do_ignore(Signal::Sigsys);
     });
 
     // Check that the `sigaltstack` system call can accept 0 for the `old` parameter.
@@ -1275,9 +1415,7 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::<F>::new();
 
         // System call number
@@ -1300,7 +1438,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
     });
 
     // Check that the `sched_getaffinity` system call can accept different cpu set sizes.
@@ -1308,17 +1446,11 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::<F>::new();
 
         // Make sure everything is readable and writable. Otherwise, we'd get access faults.
-        machine_state
-            .core
-            .main_memory
-            .protect_pages(0, MemLayout::TOTAL_BYTES, Permissions::READ_WRITE)
-            .unwrap();
+        machine_state.set_all_readable_writeable();
 
         // Mask pointer (must be non-zero)
         let mask_address = VirtAddr::new(0x100);
@@ -1365,7 +1497,7 @@ mod tests {
                 default_on_tezos_handler,
             );
 
-            assert!(result);
+            assert!(result.is_continue());
 
             // Verify that a single bit is set in the mask
             for j in 1..i {
@@ -1393,9 +1525,7 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::new();
 
         // Mask pointer (must be non-zero)
@@ -1432,7 +1562,7 @@ mod tests {
             default_on_tezos_handler,
         );
 
-        assert!(result);
+        assert!(result.is_continue());
 
         let result = machine_state.core.hart.xregisters.read(registers::a0);
 
@@ -1445,9 +1575,7 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::new();
 
         // Mask pointer (must be non-zero)
@@ -1502,7 +1630,7 @@ mod tests {
             default_on_tezos_handler,
         );
 
-        assert!(result);
+        assert!(result.is_continue());
 
         let result: u64 = machine_state.core.hart.xregisters.read(registers::a0);
 
@@ -1515,9 +1643,7 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::new();
 
         // System call number
@@ -1559,7 +1685,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
     });
 
     // Check that the `rt_sigprocmask system call can accept 0 for the `old` parameter.
@@ -1567,9 +1693,7 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         let mut supervisor_state = SupervisorState::new();
 
         // System call number
@@ -1611,7 +1735,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
     });
 
     // Check that the `clock_gettime` system call fills the timespec with zeros.
@@ -1619,17 +1743,11 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         machine_state.reset();
 
         // Make sure everything is readable and writable. Otherwise, we'd get access faults.
-        machine_state
-            .core
-            .main_memory
-            .protect_pages(0, MemLayout::TOTAL_BYTES, Permissions::READ_WRITE)
-            .unwrap();
+        machine_state.set_all_readable_writeable();
 
         let mut supervisor_state = SupervisorState::new();
 
@@ -1669,7 +1787,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
 
         // Verify that a0 contains 0 (success)
         let ret = machine_state.core.hart.xregisters.read(registers::a0);
@@ -1689,17 +1807,11 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         machine_state.reset();
 
         // Make sure everything is readable and writable. Otherwise, we'd get access faults.
-        machine_state
-            .core
-            .main_memory
-            .protect_pages(0, MemLayout::TOTAL_BYTES, Permissions::READ_WRITE)
-            .unwrap();
+        machine_state.set_all_readable_writeable();
 
         let mut supervisor_state = SupervisorState::new();
 
@@ -1748,7 +1860,7 @@ mod tests {
             StdoutDebugHooks,
             default_on_tezos_handler,
         );
-        assert!(result);
+        assert!(result.is_continue());
 
         // Verify that a0 contains 0 (success)
         let ret = machine_state.core.hart.xregisters.read(registers::a0);
@@ -1776,20 +1888,18 @@ mod tests {
         type MemLayout = M4K;
 
         let mut machine_state =
-            MachineState::<MemLayout, DefaultCacheConfig, Interpreted<MemLayout, F>, F>::new(
-                InterpretedBlockBuilder,
-            );
+            MachineState::<MemLayout, Interpreted<MemLayout, F>, F>::new(InterpretedCompiler);
         machine_state.reset();
 
         // Allocate all memory to ensure subsequent allocations will fail
-        machine_state
-            .core
-            .main_memory
+        let (main_memory, listener) = machine_state.memory_with_listener();
+        main_memory
             .allocate_and_protect_pages(
                 Some(0),
                 MemLayout::TOTAL_BYTES,
                 Permissions::READ_WRITE,
                 true,
+                listener,
             )
             .unwrap();
 
@@ -1816,7 +1926,7 @@ mod tests {
 
             // Call the function under test
             let result = supervisor_state.handle_mmap(
-                &mut machine_state.core,
+                &mut machine_state,
                 addr.into(),
                 length,
                 perms,
@@ -1844,7 +1954,7 @@ mod tests {
 
             // Call the function under test
             let result = supervisor_state.handle_mmap(
-                &mut machine_state.core,
+                &mut machine_state,
                 VirtAddr::new(addr),
                 length,
                 perms,

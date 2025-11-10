@@ -3,25 +3,51 @@
 // SPDX-License-Identifier: MIT
 
 use core::num::NonZeroU64;
-use std::fmt;
+use std::ops::ControlFlow;
 
 use super::MAIN_THREAD_ID;
 use super::error::Error;
+use crate::machine_state::ProgramCounterUpdate;
+use crate::machine_state::memory::Address;
+use crate::parser::instruction::InstrWidth;
 
 /// A type coupling the result of the system call with how the program should continue.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct SystemCallResultExecution {
+    /// Result value that will be returned to the caller of the system call
     pub result: u64,
-    pub control_flow: bool,
+
+    /// Control flow indication for the [`crate::machine_state::MachineState`] step loop
+    ///
+    /// Breaking means leaving the step loop in the machine state. In other words, it will defer to
+    /// the level above it to decide what to do.
+    pub control_flow: ControlFlow<()>,
+
+    /// Not all system calls just move the PC to the next instruction
+    /// This account for that.
+    pub pc_update: ProgramCounterUpdate<Address>,
 }
+
+/// An ECALL is 4 bytes wide, ie, an uncompressed instr
+pub(crate) const ECALL_WIDTH: InstrWidth = InstrWidth::Uncompressed;
 
 impl<T: Into<u64>> From<T> for SystemCallResultExecution {
     fn from(value: T) -> Self {
         // The default action is to continue execution after the system call. In cases where the
         // execution should halt, this should be specified.
-        SystemCallResultExecution {
+        Self {
             result: value.into(),
-            control_flow: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for SystemCallResultExecution {
+    fn default() -> Self {
+        Self {
+            result: 0,
+            control_flow: ControlFlow::Continue(()),
+            pc_update: ProgramCounterUpdate::Next(ECALL_WIDTH),
         }
     }
 }
@@ -99,7 +125,7 @@ pub(crate) const RLIMIT_NPROC: u64 = 1;
 
 /// Hard limit on the number of file descriptors that a system call can work with
 ///
-/// We also use this constant to implictly limit how much memory can be associated with a system
+/// We also use this constant to implicitly limit how much memory can be associated with a system
 /// call. For example, `ppoll` takes a pointer to an array of `struct pollfd`. If we don't limit
 /// the length of that array, then we might read an arbitrary amount of memory. This impacts the
 /// proof size dramatically as everything read would also be in the proof.
@@ -284,19 +310,14 @@ impl TryFrom<u64> for FileDescriptorWriteable {
 }
 
 /// The number (count) of file descriptors
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, derive_more::Debug)]
+#[debug("{}", self.0)]
 pub struct FileDescriptorCount(u64);
 
 impl FileDescriptorCount {
     /// Extract the file descriptor count as a [`u64`].
     pub fn count(&self) -> u64 {
         self.0
-    }
-}
-
-impl fmt::Debug for FileDescriptorCount {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 

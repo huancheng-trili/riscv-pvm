@@ -16,38 +16,45 @@ use cranelift::codegen::Context;
 use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::AbiParam;
 use cranelift::prelude::Block;
+use cranelift::prelude::EntityRef;
 use cranelift::prelude::FunctionBuilder;
 use cranelift::prelude::FunctionBuilderContext;
 use cranelift::prelude::InstBuilder;
+use cranelift::prelude::Variable;
+use cranelift::prelude::isa::TargetFrontendConfig;
 use cranelift::prelude::types::I64;
 use cranelift_jit::JITModule;
 use cranelift_module::Module;
 
 use super::instruction::Outcome;
-use crate::jit::JsaImports;
 use crate::jit::builder::instruction::InstructionBuilder;
 use crate::jit::builder::instruction::LoweredInstruction;
 use crate::jit::builder::typed::Pointer;
+use crate::jit::builder::typed::Typed;
 use crate::jit::builder::typed::Value;
+use crate::jit::state_access::ExceptionCode;
 use crate::jit::state_access::JsaCalls;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::hart_state::write_pc;
 use crate::machine_state::memory::Address;
 use crate::machine_state::memory::MemoryConfig;
-use crate::machine_state::registers::XValue;
 use crate::parser::instruction::InstrWidth;
 use crate::state_backend::owned_backend::Owned;
 use crate::state_context::StateContext;
 use crate::state_context::projection::MachineCoreProjection;
-use crate::traps::EnvironException;
+
+const STEPS_REMAINING_VAR_ID: usize = 0;
 
 /// Builder for an instruction sequence
 pub struct SequenceBuilder<'jit, MC: MemoryConfig> {
+    /// Target configuration for the JIT module
+    target_config: TargetFrontendConfig,
+
     /// IR builder
     builder: FunctionBuilder<'jit>,
 
     /// External function call manager
-    ext_calls: JsaCalls<'jit, MC>,
+    ext_calls: JsaCalls<MC>,
 
     /// Function entry block
     entry_block: Block,
@@ -55,23 +62,29 @@ pub struct SequenceBuilder<'jit, MC: MemoryConfig> {
     /// Parameter pointing to the `MachineCoreState`
     core_param: Pointer<MachineCoreState<MC, Owned>>,
 
-    /// Parameter holding the program counter at the start of the sequence
-    program_counter_param: Value<Address>,
+    /// The program counter of the start of the sequence
+    program_counter: Address,
 
     /// Offset to the program counter for the next instruction
     program_counter_offset: i64,
 
+    /// Initial maximum number of steps that can be executed in the sequence
+    max_steps_param: Value<usize>,
+
     /// Parameter pointing to the sequence result
-    result_param: Pointer<Result<(), EnvironException>>,
+    result_param: Pointer<ExceptionCode>,
+
+    /// Variable storing the maximum number of steps that can be executed in the sequence.
+    steps_remaining: Variable,
 }
 
 impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
     /// Create a new sequence builder.
     pub fn new(
         module: &'jit mut JITModule,
-        imports: &'jit JsaImports<MC>,
         context: &'jit mut Context,
         builder_context: &'jit mut FunctionBuilderContext,
+        program_counter: Address,
     ) -> Self {
         // The pointer type is host-dependent, hence we need to retrieve it from the module's
         // target configuration.
@@ -85,12 +98,14 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
         //   - `self`: Pointer to the `Jitted` block
         //   - `core`: Pointer to the `MachineCoreState`
         //   - `program_counter`: Program counter at the start of the sequence
+        //   - `max_steps`: Maximum number of steps that can be executed in the sequence
         //   - `result`: Pointer to the result of the sequence
-        //   - `block_builder`: Pointer to the `BlockBuilder` that is used to build the sequence
+        //   - `compiler`: Pointer to the `BlockBuilder` that is used to build the sequence
         // Returns:
         //   - `steps`: Number of steps executed in the sequence
         context.func.signature.params.push(AbiParam::new(ptr_type));
         context.func.signature.params.push(AbiParam::new(ptr_type));
+        context.func.signature.params.push(AbiParam::new(I64));
         context.func.signature.params.push(AbiParam::new(I64));
         context.func.signature.params.push(AbiParam::new(ptr_type));
         context.func.signature.params.push(AbiParam::new(ptr_type));
@@ -103,7 +118,7 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
 
         // [`JsaCalls`] allows us to perform calls to external functions, such as reading registers
         // or writing the program counter to the machine core state.
-        let ext_calls = JsaCalls::func_calls(module, imports, ptr_type);
+        let ext_calls = JsaCalls::new(module.target_config());
 
         // The function entry block is the first basic block in the function. It brings the function
         // parameters values into scope.
@@ -118,17 +133,23 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
             Pointer::<MachineCoreState<MC, Owned>>::from_raw(raw_value)
         };
 
-        // SAFETY: `JitFn` accepts an `Address` as the 3rd parameter.
-        let program_counter_param = unsafe {
-            let raw_value = builder.block_params(param_block)[2];
-            Value::<Address>::from_raw(raw_value)
+        // SAFETY: `JitFn` accepts a `usize` as the 4th parameter.
+        let max_steps_param = unsafe {
+            let raw_value = builder.block_params(param_block)[3];
+            Value::<usize>::from_raw(raw_value)
         };
 
-        // SAFETY: `JitFn` accepts a `&mut Result<(), EnvironException>` as the 4th parameter.
+        // SAFETY: `JitFn` accepts a `&mut ExceptionCode` as the 5th parameter.
         let result_param = unsafe {
-            let raw_value = builder.block_params(param_block)[3];
-            Pointer::<Result<(), EnvironException>>::from_raw(raw_value)
+            let raw_value = builder.block_params(param_block)[4];
+            Pointer::<ExceptionCode>::from_raw(raw_value)
         };
+
+        let steps_remaining = Variable::new(STEPS_REMAINING_VAR_ID);
+        builder.declare_var(steps_remaining, I64);
+
+        // Assign the passed in `max_steps` to the `steps_remaining` variable.
+        builder.def_var(steps_remaining, max_steps_param.to_value());
 
         // The entry block is where we will eventually transition to the first instruction basic
         // block. The function's entry block (`param_block` for our purposes) will directly jump to
@@ -136,14 +157,19 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
         let entry_block = builder.create_block();
         builder.ins().jump(entry_block, []);
 
+        let target_config = module.target_config();
+
         Self {
+            target_config,
             builder,
             ext_calls,
             entry_block,
             core_param,
-            program_counter_param,
+            program_counter,
             program_counter_offset: 0,
+            max_steps_param,
             result_param,
+            steps_remaining,
         }
     }
 
@@ -173,27 +199,19 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
         self.builder.switch_to_block(entry_block);
 
         // Compute the program counter for the instruction, if necessary.
-        let instruction_pc = if self.program_counter_offset == 0 {
-            self.program_counter_param
-        } else {
-            // SAFETY: `iadd_imm` is a unary operation that preserves the type of the program
-            // counter value.
-            unsafe {
-                self.program_counter_param.lift_unary(|program_counter| {
-                    self.builder
-                        .ins()
-                        .iadd_imm(program_counter, self.program_counter_offset)
-                })
-            }
-        };
+        let instruction_pc = self
+            .program_counter
+            .wrapping_add_signed(self.program_counter_offset);
 
         let instr_builder = InstructionBuilder::new(
+            self.target_config,
             &mut self.builder,
             &mut self.ext_calls,
             entry_block,
             instruction_pc,
             self.core_param,
             self.result_param,
+            width,
         );
 
         // The next instruction needs to be able to compute its program counter based on which
@@ -201,6 +219,38 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
         self.program_counter_offset += width as i64;
 
         instr_builder
+    }
+
+    /// Update the `steps_remaining` variable and jump to the exit block.
+    ///
+    /// `final_program_counter` is the program counter that we want to commit back to the
+    /// machine core state when exiting the sequence.
+    fn jump_to_exit(
+        &mut self,
+        steps_completed: u64,
+        final_program_counter: Value<Address>,
+        exit_block: Block,
+    ) {
+        self.update_steps_remaining(steps_completed);
+
+        self.builder.ins().jump(exit_block, &[BlockArg::Value(
+            final_program_counter.to_value(),
+        )]);
+    }
+
+    /// Decrement 'steps_remaining' by the number of steps taken in the sequence.
+    fn update_steps_remaining(&mut self, steps_completed: u64) {
+        if steps_completed == 0 {
+            return;
+        }
+
+        let steps_completed = self.builder.ins().iconst(I64, steps_completed as i64);
+
+        let steps_remaining = self.builder.use_var(self.steps_remaining);
+        let result_steps_remaining = self.builder.ins().isub(steps_remaining, steps_completed);
+
+        self.builder
+            .def_var(self.steps_remaining, result_steps_remaining);
     }
 
     /// Finish building the sequence.
@@ -211,7 +261,6 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
         // well as returning from the JIT function.
         {
             self.builder.switch_to_block(exit_block);
-            let steps = self.builder.append_block_param(exit_block, I64);
 
             // SAFETY: We're declaring the value as a `I64` which has the same representation of
             // `Address`.
@@ -222,21 +271,12 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
 
             write_pc(&mut self, final_program_counter);
 
+            let steps_remaining = self.builder.use_var(self.steps_remaining);
+            let max_steps = self.max_steps_param.to_value();
+            let steps = self.builder.ins().isub(max_steps, steps_remaining);
+
             self.builder.ins().return_(&[steps]);
         }
-
-        let jump_to_exit =
-            // `steps` is the number of successful steps that were executed in the sequence. It
-            // will be returned as the result of the JIT function.
-            // `final_program_counter` is the program counter that we want to commit back to the
-            // machine core state when existing the sequence.
-            |builder: &mut FunctionBuilder, steps: i64, final_program_counter: Value<Address>| {
-                let steps = builder.ins().iconst(I64, steps);
-                builder.ins().jump(exit_block, &[
-                    BlockArg::Value(steps),
-                    BlockArg::Value(final_program_counter.to_value()),
-                ]);
-            };
 
         let mut peekable_instrs = instrs.iter().enumerate().peekable();
 
@@ -260,68 +300,79 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
                             next_instr.build_run(&mut self.builder);
                         } else {
                             // This is a successful outcome, hence +1 step.
-                            let step_counter = instr_index as i64 + 1;
+                            let steps_completed = instr_index as u64 + 1;
 
-                            // SAFETY: `iadd_imm` preserves the type of the program counter value.
+                            let final_program_counter = instr.next_instruction_address();
+
+                            // SAFETY: We are constructing this value directly from an Address type.
                             let final_program_counter = unsafe {
-                                self.program_counter_param.lift_unary(|program_counter| {
-                                    // At this point `program_counter_offset` is the sum of all instruction
-                                    // widths. We can add it to the program counter for the start of the
-                                    // sequence to obtain the final program counter which is just past the
-                                    // last instruction.
-                                    self.builder
-                                        .ins()
-                                        .iadd_imm(program_counter, self.program_counter_offset)
-                                })
+                                Value::<Address>::from_discriminant(
+                                    &self.target_config,
+                                    &mut self.builder,
+                                    final_program_counter as i64,
+                                )
                             };
 
                             // If there is no next instruction, we jump to the exit block.
-                            jump_to_exit(&mut self.builder, step_counter, final_program_counter);
+                            self.jump_to_exit(steps_completed, final_program_counter, exit_block);
                         }
                     }
 
                     Outcome::Exception { hook } => {
                         self.builder.switch_to_block(*hook);
 
-                        // Exception outcomes do not increment the step counter, as they don't
-                        // count as a successful step.
-                        let step_counter = instr_index as i64;
+                        // Exception outcomes do not increment the step counter.
+                        let steps_completed = instr_index as u64;
 
                         // In the case of an exception, the program counter needs to refer to the
                         // instruction that caused the exception.
                         let final_program_counter = instr.program_counter();
 
-                        jump_to_exit(&mut self.builder, step_counter, final_program_counter);
+                        // SAFETY: We are constructing this value directly from an Address type.
+                        let final_program_counter = unsafe {
+                            Value::<Address>::from_discriminant(
+                                &self.target_config,
+                                &mut self.builder,
+                                final_program_counter as i64,
+                            )
+                        };
+
+                        // Exception outcomes do not increment the step counter, as they don't
+                        // count as a successful step.
+                        self.jump_to_exit(steps_completed, final_program_counter, exit_block);
                     }
 
                     Outcome::KnownBranch { offset, hook } => {
                         self.builder.switch_to_block(*hook);
 
                         // This is a successful outcome, hence +1 step.
-                        let step_counter = instr_index as i64 + 1;
+                        let steps_completed = instr_index as u64 + 1;
 
-                        // SAFETY: `iadd_imm` preserves the type of the program counter value.
+                        let final_program_counter: Address =
+                            instr.program_counter().wrapping_add_signed(*offset);
+
+                        // SAFETY: We are constructing this value directly from an Address type.
                         let final_program_counter = unsafe {
-                            // The new program counter is relative to the program counter of the
-                            // instruction that is being executed.
-                            instr.program_counter().lift_unary(|program_counter| {
-                                self.builder.ins().iadd_imm(program_counter, *offset)
-                            })
+                            Value::<Address>::from_discriminant(
+                                &self.target_config,
+                                &mut self.builder,
+                                final_program_counter as i64,
+                            )
                         };
 
-                        jump_to_exit(&mut self.builder, step_counter, final_program_counter);
+                        self.jump_to_exit(steps_completed, final_program_counter, exit_block);
                     }
 
                     Outcome::UnknownBranch { destination, hook } => {
                         self.builder.switch_to_block(*hook);
 
                         // This is a successful outcome, hence +1 step.
-                        let step_counter = instr_index as i64 + 1;
+                        let steps_completed = instr_index as u64 + 1;
 
                         // The instruction wants to jump somewhere, so we take the destination.
                         let final_program_counter = *destination;
 
-                        jump_to_exit(&mut self.builder, step_counter, final_program_counter);
+                        self.jump_to_exit(steps_completed, final_program_counter, exit_block);
                     }
                 }
             }
@@ -333,19 +384,31 @@ impl<'jit, MC: MemoryConfig> SequenceBuilder<'jit, MC> {
 }
 
 impl<MC: MemoryConfig> StateContext for SequenceBuilder<'_, MC> {
-    type X64 = Value<XValue>;
+    type Value<R> = Value<R>;
 
-    fn read_proj<P>(&mut self, param: P::Parameter) -> Self::X64
+    fn read_proj<P>(&mut self, param: P::Parameter) -> Self::Value<P::Target>
     where
-        P: MachineCoreProjection<Target = u64>,
+        P: MachineCoreProjection,
+        P::Target: Typed,
     {
-        super::read_proj::<MC, P>(&mut self.builder, self.core_param, param)
+        super::read_proj::<MC, P>(
+            &self.target_config,
+            &mut self.builder,
+            self.core_param,
+            param,
+        )
     }
 
-    fn write_proj<P>(&mut self, param: P::Parameter, value: Self::X64)
+    fn write_proj<P>(&mut self, param: P::Parameter, value: Self::Value<P::Target>)
     where
-        P: MachineCoreProjection<Target = u64>,
+        P: MachineCoreProjection,
     {
-        super::write_proj::<MC, P>(&mut self.builder, self.core_param, param, value)
+        super::write_proj::<MC, P>(
+            &self.target_config,
+            &mut self.builder,
+            self.core_param,
+            param,
+            value,
+        )
     }
 }

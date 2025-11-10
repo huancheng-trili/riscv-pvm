@@ -7,13 +7,13 @@
 //!
 //! U:C-16
 
+use crate::exceptions::Exception;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::memory;
 use crate::machine_state::registers::FRegister;
 use crate::machine_state::registers::XRegister;
 use crate::machine_state::registers::sp;
 use crate::state_backend as backend;
-use crate::traps::Exception;
 
 impl<MC, M> MachineCoreState<MC, M>
 where
@@ -75,21 +75,22 @@ mod test {
     use proptest::prelude::*;
 
     use crate::backend_test;
+    use crate::exceptions::Exception;
     use crate::machine_state::MachineCoreState;
     use crate::machine_state::memory::M4K;
     use crate::machine_state::memory::MemoryConfig;
+    use crate::machine_state::memory::listener::NoopMemoryGovernanceListener;
     use crate::machine_state::registers::fa2;
     use crate::machine_state::registers::fa3;
     use crate::machine_state::registers::parse_xregister;
     use crate::machine_state::registers::sp;
     use crate::state::NewState;
-    use crate::traps::Exception;
 
     const ZERO_OFFSET: i64 = 0;
 
     type MC = M4K;
 
-    const OUT_OF_BOUNDS_OFFSET: i64 = MC::TOTAL_BYTES as i64;
+    const OUT_OF_BOUNDS_OFFSET: i64 = MC::TOTAL_BYTES.get() as i64;
 
     backend_test!(test_cfsd_cfld, F, {
         let state = MachineCoreState::<MC, F>::new();
@@ -102,8 +103,8 @@ mod test {
             rs1 in (1_u8..31).prop_map(u5::new).prop_map(parse_xregister),
         )| {
             let mut state = state_cell.borrow_mut();
-            state.reset();
-            state.main_memory.set_all_readable_writeable();
+            state.reset(NoopMemoryGovernanceListener);
+            state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
             let mut perform_test = |offset: i64| -> Result<(), Exception> {
                 state.hart.fregisters.write(fa2, val.into());
@@ -122,7 +123,7 @@ mod test {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(OUT_OF_BOUNDS_OFFSET).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
         });
     });
@@ -137,8 +138,8 @@ mod test {
             val in any::<f64>().prop_map(f64::to_bits),
         )| {
             let mut state = state_cell.borrow_mut();
-            state.reset();
-            state.main_memory.set_all_readable_writeable();
+            state.reset(NoopMemoryGovernanceListener);
+            state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
             let mut perform_test = |offset: i64| -> Result<(), Exception> {
                 state.hart.fregisters.write(fa2, val.into());
@@ -157,7 +158,7 @@ mod test {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(OUT_OF_BOUNDS_OFFSET).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
         });
     });

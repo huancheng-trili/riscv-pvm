@@ -31,7 +31,7 @@ done < <(cargo test -- test_suite_rv64 2> /dev/null | grep 'test_suite_rv64')
 # Collect all 'passing' instructions
 echo "[INFO]: collecting tested instructions"
 
-generated_path=${top_level}/src/riscv/assets/generated
+generated_path=${top_level}/assets/generated
 
 declare -A working
 
@@ -57,8 +57,8 @@ done
 
 echo "[INFO]: found ${#working[@]} tested instructions"
 
-# Examing ignored test requirements
-echo "[INFO]: examing ignored tests"
+# Examining ignored test requirements
+echo "[INFO]: examining ignored tests"
 
 for t in "${ignored[@]}"; do
   echo -en "$(basename "$t")\t\t"

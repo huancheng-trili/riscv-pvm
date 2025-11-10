@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use bincode::Encode;
+
 use super::AllocatedOf;
 use super::Array;
 use super::Atom;
@@ -34,30 +36,39 @@ impl<T: CommitmentLayout> CommitmentLayout for Box<T> {
 
 impl<T> CommitmentLayout for Atom<T>
 where
-    T: serde::Serialize + 'static,
+    T: Encode + 'static,
 {
     fn state_hash<M: ManagerSerialise>(state: AllocatedOf<Self, M>) -> Result<Hash, HashError> {
-        Hash::blake2b_hash(state)
+        Ok(Hash::blake3_hash(state)?)
     }
 }
 
 impl<T, const LEN: usize> CommitmentLayout for Array<T, LEN>
 where
-    T: serde::Serialize + Copy + 'static,
+    T: Encode + 'static,
 {
     fn state_hash<M: ManagerSerialise>(state: AllocatedOf<Self, M>) -> Result<Hash, HashError> {
-        Hash::blake2b_hash(state)
+        Ok(Hash::blake3_hash(state)?)
     }
 }
 
-impl<const LEN: usize> CommitmentLayout for DynArray<LEN> {
+impl CommitmentLayout for DynArray {
     fn state_hash<M: ManagerSerialise>(state: AllocatedOf<Self, M>) -> Result<Hash, HashError> {
+        let length = state.len();
+
         let mut writer = HashWriter::new(MERKLE_LEAF_SIZE);
-        chunks_to_writer::<LEN, _, _>(&mut writer, |address| {
-            state.read::<[u8; MERKLE_LEAF_SIZE.get()]>(address)
+        chunks_to_writer::<_, _>(&mut writer, length, |address| {
+            // SAFETY: The chunk writer will only request data within the bounds that we specified.
+            // Given we provided the correct length, this is safe.
+            unsafe { state.read::<[u8; MERKLE_LEAF_SIZE.get()]>(address) }
         })?;
-        let hashes = writer.finalise()?;
-        hash::build_custom_merkle_hash(MERKLE_ARITY, hashes)
+        let hashes = writer.finalise();
+        let pages_node = hash::build_custom_merkle_hash(MERKLE_ARITY, hashes)?;
+
+        let length_node = Hash::blake3_hash(length as u64)?;
+        let root_node = Hash::combine([length_node, pages_node]);
+
+        Ok(root_node)
     }
 }
 
@@ -68,7 +79,7 @@ where
 {
     fn state_hash<M: ManagerSerialise>(state: AllocatedOf<Self, M>) -> Result<Hash, HashError> {
         let hashes = [A::state_hash(state.0)?, B::state_hash(state.1)?];
-        Hash::combine(&hashes)
+        Ok(Hash::combine(hashes))
     }
 }
 
@@ -84,7 +95,7 @@ where
             B::state_hash(state.1)?,
             C::state_hash(state.2)?,
         ];
-        Hash::combine(&hashes)
+        Ok(Hash::combine(hashes))
     }
 }
 
@@ -102,7 +113,7 @@ where
             C::state_hash(state.2)?,
             D::state_hash(state.3)?,
         ];
-        Hash::combine(&hashes)
+        Ok(Hash::combine(hashes))
     }
 }
 
@@ -122,7 +133,7 @@ where
             D::state_hash(state.3)?,
             E::state_hash(state.4)?,
         ];
-        Hash::combine(&hashes)
+        Ok(Hash::combine(hashes))
     }
 }
 
@@ -144,7 +155,7 @@ where
             E::state_hash(state.4)?,
             F::state_hash(state.5)?,
         ];
-        Hash::combine(&hashes)
+        Ok(Hash::combine(hashes))
     }
 }
 
@@ -153,11 +164,7 @@ where
     T: CommitmentLayout,
 {
     fn state_hash<M: ManagerSerialise>(state: AllocatedOf<Self, M>) -> Result<Hash, HashError> {
-        let hashes: Vec<Hash> = state
-            .into_iter()
-            .map(T::state_hash)
-            .collect::<Result<Vec<_>, _>>()?;
-        Hash::combine(&hashes)
+        Hash::try_combine(state.into_iter().map(T::state_hash))
     }
 }
 

@@ -8,7 +8,20 @@
 
 set -e
 
-USAGE="Usage: -t <num_transfers> [ -s: static inbox ] [ -p: profile with samply ] [ -n: run natively ] [ -i <num_iterations>: number of runs ] [ -j <disable|inline>: disable jit / use inline jit ] [ -m <all | jit-unsupported>: enable metrics ]"
+USAGE="Usage:
+  REQUIRED:
+    -t <num_transfers>
+  OPTIONAL:
+    -s: static inbox
+    -p: profile with samply
+    -n: run natively
+    -i <num_iterations>: number of runs
+    -w <num_warmup_tx>: number of warmup transactions
+       Run additional transactions before the benchmarking scenario.
+       This allows performance to be measured excluding warmup-time for
+       various caches to be populated or JIT compilation to take place.
+    -j <disable|inline>: disable jit / use inline jit"
+
 DEFAULT_ROLLUP_ADDRESS="sr163Lv22CdE8QagCwf48PWDTquk6isQwv57"
 
 ITERATIONS="1"
@@ -18,16 +31,15 @@ SANDBOX_BIN="riscv-sandbox"
 SANDBOX_ENABLE_FEATURES=()
 PROFILING_WRAPPER=""
 SAMPLY_OUT="riscv-sandbox-profile.json"
-METRICS=""
-METRICS_ARGS=()
 NATIVE=""
-JSTZ_SANDBOX_PARAMS=("--input" "jstz/target/riscv64gc-unknown-linux-musl/release/jstz")
+JSTZ_SANDBOX_PARAMS=("--input" "kernels/jstz/target/riscv64gc-unknown-linux-musl/release/jstz")
+WARMUP_TX="0"
 
 CURR=$(pwd)
 RISCV_DIR=$(dirname "$0")/..
-cd "$RISCV_DIR/src/riscv"
+cd "$RISCV_DIR"
 
-while getopts "i:t:m:spnj:" OPTION; do
+while getopts "i:t:m:w:spnj:" OPTION; do
   case "$OPTION" in
   i)
     ITERATIONS="$OPTARG"
@@ -43,7 +55,7 @@ while getopts "i:t:m:spnj:" OPTION; do
     PROFILING_WRAPPER="samply record -s -o $SAMPLY_OUT"
     ;;
   n)
-    NATIVE=$(make --silent -C jstz print-native-target | grep -wv make)
+    NATIVE=$(make --silent -C kernels/jstz print-native-target | grep -wv make)
     ;;
   j)
     case "$OPTARG" in
@@ -59,20 +71,8 @@ while getopts "i:t:m:spnj:" OPTION; do
       ;;
     esac
     ;;
-  m)
-    SANDBOX_ENABLE_FEATURES+=("metrics")
-    METRICS="y"
-
-    case "$OPTARG" in
-    all) ;;
-    jit-unsupported)
-      METRICS_ARGS+=("--exclude-supported-instructions")
-      ;;
-    *)
-      echo "$USAGE"
-      exit 1
-      ;;
-    esac
+  w)
+    WARMUP_TX="$OPTARG"
     ;;
   *)
     echo "$USAGE"
@@ -86,6 +86,8 @@ if [ -z "$TX" ]; then
   exit 1
 fi
 
+TOTAL_TX=$(("$TX" + "$WARMUP_TX"))
+
 if [ -n "$NATIVE" ] && [ -z "$STATIC_INBOX" ]; then
   echo "Native compilation without static inbox unsupported"
   echo "$USAGE"
@@ -93,44 +95,38 @@ if [ -n "$NATIVE" ] && [ -z "$STATIC_INBOX" ]; then
 fi
 
 echo "[INFO]: building sandbox"
-make "SANDBOX_ENABLE_FEATURES=${SANDBOX_ENABLE_FEATURES[*]}" "$SANDBOX_BIN" &> /dev/null
+make -C tools/sandbox "SANDBOX_ENABLE_FEATURES=${SANDBOX_ENABLE_FEATURES[*]}" "$SANDBOX_BIN" &> /dev/null
 echo "[INFO]: building bench tool"
-make -C jstz inbox-bench &> /dev/null
+make -C kernels/jstz inbox-bench &> /dev/null
 
 DATA_DIR=${DATA_DIR:=$(mktemp -d)}
 
-echo "[INFO]: generating $TX transfers"
+echo "[INFO]: generating $TX transfers with $WARMUP_TX warmup tx"
 INBOX_FILE="${DATA_DIR}/inbox.json"
 RUN_INBOX="$INBOX_FILE"
-./jstz/inbox-bench generate --inbox-file "$INBOX_FILE" --transfers "$TX"
+kernels/jstz/inbox-bench generate --inbox-file "$INBOX_FILE" --transfers "$TOTAL_TX"
 
 log_file_args=()
-
-BLOCK_METRICS_FILE="${DATA_DIR}/block-metrics.out"
-if [ -n "$METRICS" ]; then
-  METRICS_ARGS+=("--block-metrics-file" "${BLOCK_METRICS_FILE}")
-fi
 
 ##########
 # RISC-V #
 ##########
 build_jstz_riscv() {
   if [ "$STATIC_INBOX" = "y" ]; then
-    INBOX_FILE="$INBOX_FILE" make -C jstz build-kernel-static &> /dev/null
+    INBOX_FILE="$INBOX_FILE" make -C kernels/jstz build-kernel-static &> /dev/null
     RUN_INBOX="$DATA_DIR"/empty.json
     echo "[]" > "$RUN_INBOX"
   else
-    make -C jstz build-kernel &> /dev/null
+    make -C kernels/jstz build-kernel &> /dev/null
   fi
 }
 
 run_jstz_riscv() {
   LOG="$DATA_DIR/log.$1.log"
-  $PROFILING_WRAPPER "./$SANDBOX_BIN" run \
+  $PROFILING_WRAPPER "tools/sandbox/$SANDBOX_BIN" run \
     "${JSTZ_SANDBOX_PARAMS[@]}" \
     --inbox-file "$RUN_INBOX" \
     --address "$DEFAULT_ROLLUP_ADDRESS" \
-    "${METRICS_ARGS[@]}" \
     --timings > "$LOG"
   log_file_args+=("--log-file=$LOG")
 }
@@ -139,12 +135,12 @@ run_jstz_riscv() {
 # Native #
 ##########
 build_jstz_native() {
-  INBOX_FILE=$INBOX_FILE make -C jstz build-kernel-native &> /dev/null
+  INBOX_FILE=$INBOX_FILE make -C kernels/jstz build-kernel-native &> /dev/null
 }
 
 run_jstz_native() {
   LOG="$DATA_DIR/log.$1.log"
-  $PROFILING_WRAPPER ./jstz/target/"$NATIVE"/release/jstz \
+  $PROFILING_WRAPPER kernels/jstz/target/"$NATIVE"/release/jstz \
     --timings > "$LOG" 2> /dev/null
   log_file_args+=("--log-file=$LOG")
 }
@@ -180,7 +176,7 @@ run_jstz() {
 
 collect() {
   echo -e "\033[1m"
-  ./jstz/inbox-bench results --inbox-file "$INBOX_FILE" "${log_file_args[@]}" --expected-transfers "$TX"
+  kernels/jstz/inbox-bench results --inbox-file "$INBOX_FILE" "${log_file_args[@]}" --expected-transfers "$TOTAL_TX" --exclude-warmup-transfers "$WARMUP_TX"
   echo -e "\033[0m"
 }
 
@@ -194,10 +190,6 @@ collect
 if [ -n "$PROFILING_WRAPPER" ]; then
   echo "[INFO]: collecting results"
   samply load $SAMPLY_OUT
-fi
-
-if [ -n "${METRICS}" ]; then
-  echo "Block metrics at ${BLOCK_METRICS_FILE}"
 fi
 
 cd "$CURR"

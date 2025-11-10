@@ -1,0 +1,15 @@
+[package]
+name = "octez-riscv-test-utils"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+const_format.workspace = true
+octez-riscv.workspace = true
+rand.workspace = true
+tezos-smart-rollup-utils.workspace = true

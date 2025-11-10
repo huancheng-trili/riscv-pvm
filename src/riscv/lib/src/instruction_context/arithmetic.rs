@@ -2,14 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Arithmetic operations required in the [`ICB`], including implementations for interpreted mode.
+//! Arithmetic operations required in the [`super::ICB`], including implementations for interpreted mode.
 
-use super::ICB;
 use super::Shift;
 use crate::machine_state::registers::XValue;
 use crate::machine_state::registers::XValue32;
 
-/// Trait for arithmetic operations on **XValues** used in the [`ICB`].
+/// Trait for arithmetic operations on **XValues** used in the [`super::ICB`].
 pub trait Arithmetic<I: ?Sized>: Copy {
     /// Perform a wrapping add of two **XValues**, returning the new value.
     ///
@@ -48,6 +47,9 @@ pub trait Arithmetic<I: ?Sized>: Copy {
     /// Negate the value of the **XValue**.
     fn negate(self, icb: &mut I) -> Self;
 
+    /// Perform a bitwise not of the **XValue**, returning the new value.
+    fn not(self, icb: &mut I) -> Self;
+
     /// Perform a shift of the **XValue** as determined by the given [`Shift`].
     fn shift(self, shift: Shift, amount: Self, icb: &mut I) -> Self;
 
@@ -71,7 +73,7 @@ pub trait Arithmetic<I: ?Sized>: Copy {
     fn max_unsigned(self, other: Self, icb: &mut I) -> Self;
 }
 
-impl<I: ICB> Arithmetic<I> for XValue {
+impl<I: ?Sized> Arithmetic<I> for XValue {
     fn add(self, other: Self, _: &mut I) -> Self {
         self.wrapping_add(other)
     }
@@ -108,6 +110,10 @@ impl<I: ICB> Arithmetic<I> for XValue {
         0_u64.wrapping_sub(self)
     }
 
+    fn not(self, _: &mut I) -> Self {
+        !self
+    }
+
     fn shift(self, shift: Shift, amount: Self, _: &mut I) -> Self {
         match shift {
             Shift::Left => self << amount,
@@ -141,7 +147,7 @@ impl<I: ICB> Arithmetic<I> for XValue {
     }
 }
 
-impl<I: ICB> Arithmetic<I> for XValue32 {
+impl<I: ?Sized> Arithmetic<I> for XValue32 {
     fn add(self, other: Self, _: &mut I) -> Self {
         self.wrapping_add(other)
     }
@@ -176,6 +182,10 @@ impl<I: ICB> Arithmetic<I> for XValue32 {
 
     fn negate(self, _: &mut I) -> Self {
         0_u32.wrapping_sub(self)
+    }
+
+    fn not(self, _: &mut I) -> Self {
+        !self
     }
 
     fn shift(self, shift: Shift, amount: Self, _: &mut I) -> Self {

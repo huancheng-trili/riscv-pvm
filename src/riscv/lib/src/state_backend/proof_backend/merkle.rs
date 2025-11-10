@@ -4,7 +4,6 @@
 
 //! Merkle trees used for proof generation by the PVM
 
-use std::convert::Infallible;
 use std::num::NonZeroUsize;
 
 use super::DynAccess;
@@ -49,17 +48,17 @@ impl MerkleTree {
 
     /// Make a Merkle tree consisting of a single leaf; representing
     /// the given data and its access pattern.
-    pub fn make_merkle_leaf(data: Vec<u8>, access_info: bool) -> Result<Self, HashError> {
-        let hash = Hash::blake2b_hash_bytes(&data)?;
-        Ok(MerkleTree::Leaf(hash, access_info, data))
+    pub fn make_merkle_leaf(data: Vec<u8>, access_info: bool) -> Self {
+        let hash = Hash::blake3_hash_bytes(&data);
+        MerkleTree::Leaf(hash, access_info, data)
     }
 
     /// Make a Merkle tree consisting of a node which combines the given
     /// child trees.
-    pub fn make_merkle_node(children: Vec<Self>) -> Result<Self, HashError> {
-        let children_hashes: Vec<Hash> = children.iter().map(|t| t.root_hash()).collect();
-        let node_hash = Hash::combine(children_hashes.as_slice())?;
-        Ok(MerkleTree::Node(node_hash, children))
+    pub fn make_merkle_node(children: Vec<Self>) -> Self {
+        let children_hashes = children.iter().map(|t| t.root_hash());
+        let node_hash = Hash::combine(children_hashes);
+        MerkleTree::Node(node_hash, children)
     }
 
     /// Compress into a [`CompressedMerkleTree`].
@@ -67,30 +66,30 @@ impl MerkleTree {
     /// To fit a proof in a manager operation, the Merkle tree it contains
     /// is compressed by folding all fully blindable subtrees (those in which
     /// no leaf was accessed) into blinded leaves.
-    fn compress(self) -> Result<CompressedMerkleTree, HashError> {
-        use CompressedMerkleTree::Leaf as CompresedLeaf;
-        use CompressedMerkleTree::Node as CompresedNode;
+    fn compress(self) -> CompressedMerkleTree {
+        use CompressedMerkleTree::Leaf as CompressedLeaf;
+        use CompressedMerkleTree::Node as CompressedNode;
 
         impl_modify_map_collect(
             self,
             |subtree| match subtree {
                 MerkleTree::Leaf(hash, access_info, data) => {
-                    Ok(ModifyResult::LeafStop((hash, access_info, data)))
+                    ModifyResult::LeafStop((hash, access_info, data))
                 }
-                MerkleTree::Node(hash, children) => Ok(ModifyResult::NodeContinue(hash, children)),
+                MerkleTree::Node(hash, children) => ModifyResult::NodeContinue(hash, children),
             },
-            |(hash, access, data)| Ok((hash, CompressedAccessInfo::from_access_info(access, data))),
+            |(hash, access, data)| (hash, CompressedAccessInfo::from_access_info(access, data)),
             |hash, compact_children| {
                 let (hashes, compressions) = compact_children
                     .iter()
                     .map(|child| {
                         use CompressedAccessInfo::*;
                         match child {
-                            CompresedLeaf(hash, access_info) => (hash, match access_info {
+                            CompressedLeaf(hash, access_info) => (hash, match access_info {
                                 NoAccess => Some(access_info.clone()),
                                 ReadWrite(_) => None,
                             }),
-                            CompresedNode(hash, _) => (hash, None),
+                            CompressedNode(hash, _) => (hash, None),
                         }
                     })
                     .unzip::<_, _, Vec<Hash>, Vec<_>>();
@@ -102,20 +101,18 @@ impl MerkleTree {
                     .reduce(|a, b| (a == b).then_some(a?))
                     .flatten();
 
-                let compressed_tree = match compression {
-                    Some(access) => CompresedLeaf(Hash::combine(hashes.as_slice())?, access),
-                    None => CompresedNode(hash, compact_children),
-                };
-
-                Ok(compressed_tree)
+                match compression {
+                    Some(access) => CompressedLeaf(Hash::combine(hashes), access),
+                    None => CompressedNode(hash, compact_children),
+                }
             },
         )
     }
 
     /// Produce a minimal Merkle proof on the compressed representation of the
     /// given tree.
-    pub fn to_merkle_proof(self) -> Result<MerkleProof, HashError> {
-        Ok(self.compress()?.into())
+    pub fn to_merkle_proof(self) -> MerkleProof {
+        self.compress().into()
     }
 }
 
@@ -131,28 +128,21 @@ enum CompressedMerkleTree {
 impl From<CompressedMerkleTree> for MerkleProof {
     fn from(value: CompressedMerkleTree) -> Self {
         // Explicitly stating error type to enforce the infallible error type
-        let res: Result<_, Infallible> = impl_modify_map_collect(
+        impl_modify_map_collect(
             value,
             |subtree| match subtree {
-                CompressedMerkleTree::Leaf(hash, access) => {
-                    Ok(ModifyResult::LeafStop((hash, access)))
-                }
-                CompressedMerkleTree::Node(_, children) => {
-                    Ok(ModifyResult::NodeContinue((), children))
-                }
+                CompressedMerkleTree::Leaf(hash, access) => ModifyResult::LeafStop((hash, access)),
+                CompressedMerkleTree::Node(_, children) => ModifyResult::NodeContinue((), children),
             },
             |(hash, access)| {
                 use CompressedAccessInfo::*;
-                Ok(match access {
+                match access {
                     NoAccess => MerkleProofLeaf::Blind(hash),
                     ReadWrite(data) => MerkleProofLeaf::Read(data),
-                })
+                }
             },
-            |(), children| Ok(MerkleProof::Node(children)),
-        );
-
-        // No panic: error type is infallible
-        res.unwrap()
+            |(), children| MerkleProof::Node(children),
+        )
     }
 }
 
@@ -208,20 +198,17 @@ impl AccessInfoAggregatable for () {
 ///
 /// [`CommitmentLayout`]: crate::state_backend::commitment_layout::CommitmentLayout
 /// [`ProofLayout`]: crate::state_backend::proof_layout::ProofLayout
-pub(crate) fn chunks_to_writer<
-    const LEN: usize,
-    T: std::io::Write,
-    F: Fn(usize) -> [u8; MERKLE_LEAF_SIZE.get()],
->(
+pub(crate) fn chunks_to_writer<T: std::io::Write, F: Fn(usize) -> [u8; MERKLE_LEAF_SIZE.get()]>(
     writer: &mut T,
+    len: usize,
     read: F,
 ) -> Result<(), std::io::Error> {
     let merkle_leaf_size = MERKLE_LEAF_SIZE.get();
-    assert!(LEN >= merkle_leaf_size);
+    assert!(len >= merkle_leaf_size);
 
     let mut address = 0;
 
-    while address + merkle_leaf_size <= LEN {
+    while address + merkle_leaf_size <= len {
         writer.write_all(read(address).as_slice())?;
         address += merkle_leaf_size;
     }
@@ -229,10 +216,10 @@ pub(crate) fn chunks_to_writer<
     // When the last chunk is smaller than `MERKLE_LEAF_SIZE`,
     // read the last `MERKLE_LEAF_SIZE` bytes and pass a subslice containing
     // only the bytes not previously read to the writer.
-    if address != LEN {
+    if address != len {
         address += merkle_leaf_size;
-        let buffer = read(LEN.saturating_sub(merkle_leaf_size));
-        writer.write_all(&buffer[address.saturating_sub(LEN)..])?;
+        let buffer = read(len.saturating_sub(merkle_leaf_size));
+        writer.write_all(&buffer[address.saturating_sub(len)..])?;
     };
 
     Ok(())
@@ -277,7 +264,7 @@ impl MerkleWriter {
 
     /// Commit the leaf corresponding to the contents of the buffer before
     /// clearing it.
-    fn flush_buffer(&mut self) -> Result<(), HashError> {
+    fn flush_buffer(&mut self) {
         let pos = self.leaves.len() * self.leaf_size;
         let range = pos..pos + self.leaf_size;
 
@@ -290,10 +277,8 @@ impl MerkleWriter {
         self.leaves.push(MerkleTree::make_merkle_leaf(
             self.buffer.clone(),
             access_info,
-        )?);
+        ));
         self.buffer.clear();
-
-        Ok(())
     }
 
     /// Finalise the writer by generating the Merkle tree with the configured
@@ -301,7 +286,7 @@ impl MerkleWriter {
     /// a smaller arity.
     pub fn finalise(mut self) -> Result<MerkleTree, HashError> {
         if !self.buffer.is_empty() {
-            self.flush_buffer()?;
+            self.flush_buffer();
         }
 
         build_custom_merkle_tree(self.arity, self.leaves)
@@ -322,7 +307,7 @@ impl std::io::Write for MerkleWriter {
 
             // If the buffer has been completely filled, flush it.
             if rem_buffer_len == new_buf_len {
-                self.flush_buffer().map_err(std::io::Error::other)?;
+                self.flush_buffer();
             }
         }
         Ok(consumed)
@@ -342,9 +327,7 @@ impl MerkleTree {
 
         while let Some(node) = deque.pop_front() {
             let is_valid_hash = match node {
-                Self::Leaf(hash, _, data) => {
-                    Hash::blake2b_hash_bytes(data).is_ok_and(|h| h == *hash)
-                }
+                Self::Leaf(hash, _, data) => &Hash::blake3_hash_bytes(data) == hash,
                 Self::Node(hash, children) => {
                     let children_hashes: Vec<Hash> = children
                         .iter()
@@ -354,7 +337,7 @@ impl MerkleTree {
                         })
                         .collect();
 
-                    Hash::combine(&children_hashes).is_ok_and(|h| h == *hash)
+                    &Hash::combine(children_hashes) == hash
                 }
             };
             if !is_valid_hash {
@@ -379,7 +362,7 @@ pub(crate) fn build_custom_merkle_tree(
 
     while nodes.len() > 1 {
         for chunk in nodes.chunks(arity) {
-            next_level.push(MerkleTree::make_merkle_node(chunk.to_vec())?)
+            next_level.push(MerkleTree::make_merkle_node(chunk.to_vec()))
         }
 
         std::mem::swap(&mut nodes, &mut next_level);
@@ -431,19 +414,15 @@ mod tests {
                     Self::Leaf(hash, access_info) => match access_info {
                         CompressedAccessInfo::NoAccess => true,
                         CompressedAccessInfo::ReadWrite(data) => {
-                            Hash::blake2b_hash_bytes(data).is_ok_and(|h| h == *hash)
+                            &Hash::blake3_hash_bytes(data) == hash
                         }
                     },
                     Self::Node(hash, children) => {
-                        let children_hashes: Vec<Hash> = children
-                            .iter()
-                            .map(|child| {
-                                deque.push_back(child);
-                                child.root_hash()
-                            })
-                            .collect();
-
-                        Hash::combine(&children_hashes).is_ok_and(|h| h == *hash)
+                        let children_hashes = children.iter().map(|child| {
+                            deque.push_back(child);
+                            child.root_hash()
+                        });
+                        &Hash::combine(children_hashes) == hash
                     }
                 };
                 if !is_valid_hash {
@@ -455,11 +434,11 @@ mod tests {
     }
 
     fn m_l(data: &[u8], access: bool) -> Result<MerkleTree, HashError> {
-        let hash = Hash::blake2b_hash_bytes(data)?;
+        let hash = Hash::blake3_hash_bytes(data);
         Ok(MerkleTree::Leaf(hash, access, data.to_vec()))
     }
 
-    fn m_t(left: MerkleTree, right: MerkleTree) -> Result<MerkleTree, HashError> {
+    fn m_t(left: MerkleTree, right: MerkleTree) -> MerkleTree {
         MerkleTree::make_merkle_node(vec![left, right])
     }
 
@@ -467,27 +446,24 @@ mod tests {
     fn test_compression() {
         let test = |l: Vec<Vec<u8>>| -> Result<_, HashError> {
             // The LHS leaf will be blinded
-            let single_leaves_t = m_t(m_l(&l[0], false)?, m_l(&l[1], true)?)?;
+            let single_leaves_t = m_t(m_l(&l[0], false)?, m_l(&l[1], true)?);
 
             // The whole subtree will be blinded and compressed
             let no_access_t = m_t(
                 m_l(&l[2], false)?,
-                m_t(m_l(&l[3], false)?, m_l(&l[4], false)?)?,
-            )?;
+                m_t(m_l(&l[3], false)?, m_l(&l[4], false)?),
+            );
 
             // No leaf will be blinded, the tree will not be compressed
-            let read_write_3_t = m_t(
-                m_t(m_l(&l[5], true)?, m_l(&l[6], true)?)?,
-                m_l(&l[7], true)?,
-            )?;
+            let read_write_3_t = m_t(m_t(m_l(&l[5], true)?, m_l(&l[6], true)?), m_l(&l[7], true)?);
 
             // No leaf will be blinded, the tree will not be compressed
             let read_write_4_t = m_t(
-                m_t(m_l(&l[8], true)?, m_l(&l[9], true)?)?,
-                m_t(m_l(&l[10], true)?, m_l(&l[11], true)?)?,
-            )?;
+                m_t(m_l(&l[8], true)?, m_l(&l[9], true)?),
+                m_t(m_l(&l[10], true)?, m_l(&l[11], true)?),
+            );
 
-            let combine_isolated_t = m_t(m_t(no_access_t, read_write_3_t)?, read_write_4_t)?;
+            let combine_isolated_t = m_t(m_t(no_access_t, read_write_3_t), read_write_4_t);
 
             let mix_t = m_t(
                 // The whole subtree will be compressed
@@ -495,24 +471,24 @@ mod tests {
                     m_l(&l[12], false)?,
                     m_t(
                         m_l(&l[13], false)?,
-                        m_t(m_l(&l[14], false)?, m_l(&l[15], false)?)?,
-                    )?,
-                )?,
+                        m_t(m_l(&l[14], false)?, m_l(&l[15], false)?),
+                    ),
+                ),
                 m_t(
                     m_t(
                         m_l(&l[16], true)?,
                         // Only the non-accessed leaves will be compressed
-                        m_t(m_l(&l[17], false)?, m_l(&l[18], false)?)?,
-                    )?,
+                        m_t(m_l(&l[17], false)?, m_l(&l[18], false)?),
+                    ),
                     m_l(&l[19], true)?,
-                )?,
-            )?;
+                ),
+            );
 
-            let merkle_tree = m_t(single_leaves_t, m_t(combine_isolated_t, mix_t)?)?;
+            let merkle_tree = m_t(single_leaves_t, m_t(combine_isolated_t, mix_t));
 
             let merkle_proof_leaf =
                 |data: &Vec<u8>, access: bool| -> Result<MerkleProof, HashError> {
-                    let hash = Hash::blake2b_hash_bytes(data)?;
+                    let hash = Hash::blake3_hash_bytes(data);
                     Ok(MerkleProof::Leaf(if access {
                         MerkleProofLeaf::Read(data.clone())
                     } else {
@@ -526,13 +502,13 @@ mod tests {
             ]);
 
             // The structure of the original subtree is compressed into a single leaf.
-            let proof_no_access = MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine(&[
-                Hash::blake2b_hash_bytes(&l[2])?,
-                Hash::combine(&[
-                    Hash::blake2b_hash_bytes(&l[3])?,
-                    Hash::blake2b_hash_bytes(&l[4])?,
-                ])?,
-            ])?));
+            let proof_no_access = MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine([
+                Hash::blake3_hash_bytes(&l[2]),
+                Hash::combine([
+                    Hash::blake3_hash_bytes(&l[3]),
+                    Hash::blake3_hash_bytes(&l[4]),
+                ]),
+            ])));
 
             let proof_read_write_3 = MerkleProof::Node(vec![
                 MerkleProof::Node(vec![
@@ -560,23 +536,23 @@ mod tests {
 
             let proof_mix = MerkleProof::Node(vec![
                 // The structure of the original subtree is compressed into a single leaf.
-                MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine(&[
-                    Hash::blake2b_hash_bytes(&l[12])?,
-                    Hash::combine(&[
-                        Hash::blake2b_hash_bytes(&l[13])?,
-                        Hash::combine(&[
-                            Hash::blake2b_hash_bytes(&l[14])?,
-                            Hash::blake2b_hash_bytes(&l[15])?,
-                        ])?,
-                    ])?,
-                ])?)),
+                MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine([
+                    Hash::blake3_hash_bytes(&l[12]),
+                    Hash::combine([
+                        Hash::blake3_hash_bytes(&l[13]),
+                        Hash::combine([
+                            Hash::blake3_hash_bytes(&l[14]),
+                            Hash::blake3_hash_bytes(&l[15]),
+                        ]),
+                    ]),
+                ]))),
                 MerkleProof::Node(vec![
                     MerkleProof::Node(vec![
                         merkle_proof_leaf(&l[16], true)?,
-                        MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine(&[
-                            Hash::blake2b_hash_bytes(&l[17])?,
-                            Hash::blake2b_hash_bytes(&l[18])?,
-                        ])?)),
+                        MerkleProof::Leaf(MerkleProofLeaf::Blind(Hash::combine([
+                            Hash::blake3_hash_bytes(&l[17]),
+                            Hash::blake3_hash_bytes(&l[18]),
+                        ]))),
                     ]),
                     merkle_proof_leaf(&l[19], true)?,
                 ]),
@@ -589,18 +565,15 @@ mod tests {
 
             let merkle_tree_root_hash = merkle_tree.root_hash();
 
-            let compressed_merkle_tree = merkle_tree.clone().compress()?;
+            let compressed_merkle_tree = merkle_tree.clone().compress();
             assert!(compressed_merkle_tree.check_root_hash());
             assert_eq!(compressed_merkle_tree.root_hash(), merkle_tree_root_hash);
 
             let compressed_merkle_proof: MerkleProof = compressed_merkle_tree.into();
             assert_eq!(compressed_merkle_proof, proof);
 
-            assert_eq!(merkle_tree.to_merkle_proof().unwrap(), proof);
-            assert_eq!(
-                compressed_merkle_proof.root_hash().unwrap(),
-                merkle_tree_root_hash
-            );
+            assert_eq!(merkle_tree.to_merkle_proof(), proof);
+            assert_eq!(compressed_merkle_proof.root_hash(), merkle_tree_root_hash);
 
             Ok(())
         };
@@ -625,7 +598,7 @@ mod tests {
 
         let gen_hash_data = || {
             let data = rand::random::<[u8; 12]>().to_vec();
-            let hash = Hash::blake2b_hash_bytes(&data).unwrap();
+            let hash = Hash::blake3_hash_bytes(&data);
             (data, hash)
         };
 
@@ -693,7 +666,7 @@ mod tests {
                     };
 
                     let mut writer = Cursor::new(Vec::new());
-                    chunks_to_writer::<LEN, _, _>(&mut writer, read).unwrap();
+                    chunks_to_writer::< _, _>(&mut writer, LEN, read).unwrap();
                     assert_eq!(writer.into_inner(), data);
                 }
             }

@@ -94,8 +94,10 @@ mod test {
 
     use super::*;
     use crate::backend_test;
+    use crate::exceptions::Exception;
     use crate::machine_state::MachineCoreState;
     use crate::machine_state::memory::M4K;
+    use crate::machine_state::memory::listener::NoopMemoryGovernanceListener;
     use crate::machine_state::registers::a1;
     use crate::machine_state::registers::a2;
     use crate::machine_state::registers::a3;
@@ -107,7 +109,6 @@ mod test {
     use crate::machine_state::registers::t3;
     use crate::machine_state::registers::t4;
     use crate::state::NewState;
-    use crate::traps::Exception;
 
     backend_test!(test_run_li, F, {
         let imm_rdrs1_res = [
@@ -152,8 +153,8 @@ mod test {
         )|
         {
             let mut state = state_cell.borrow_mut();
-            state.reset();
-            state.main_memory.set_all_readable_writeable();
+            state.reset(NoopMemoryGovernanceListener);
+            state.main_memory.set_all_readable_writeable(NoopMemoryGovernanceListener);
 
             let mut perform_test = |offset: u64, signed: bool| -> Result<(), Exception> {
                 // Save test values v_i in registers ai
@@ -205,7 +206,7 @@ mod test {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(invalid_offset, true).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
             // Aligned loads / stores
             prop_assert!(perform_test(aligned_offset, true).is_ok());
@@ -214,7 +215,7 @@ mod test {
 
             // Out of bounds loads / stores
             prop_assert!(perform_test(invalid_offset, false).is_err_and(|e|
-                matches!(e, Exception::StoreAMOAccessFault(_))
+                matches!(e, Exception::StoreAMOAccessFault)
             ));
             // Aligned loads / stores
             prop_assert!(perform_test(aligned_offset, false).is_ok());

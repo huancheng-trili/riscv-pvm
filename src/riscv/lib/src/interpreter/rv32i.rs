@@ -6,12 +6,12 @@
 //!
 //! Chapter 2 - Unprivileged spec
 
+use crate::exceptions::Exception;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::hart_state::HartState;
 use crate::machine_state::memory;
 use crate::parser::instruction::FenceSet;
 use crate::state_backend as backend;
-use crate::traps::Exception;
 
 impl<M> HartState<M>
 where
@@ -51,22 +51,20 @@ mod tests {
     use proptest::proptest;
 
     use crate::backend_test;
-    use crate::interpreter::integer::run_and;
+    use crate::exceptions::Exception;
     use crate::interpreter::integer::run_andi;
-    use crate::interpreter::integer::run_or;
     use crate::machine_state::MachineCoreState;
     use crate::machine_state::hart_state::HartState;
     use crate::machine_state::memory::M4K;
+    use crate::machine_state::memory::listener::NoopMemoryGovernanceListener;
     use crate::machine_state::registers::a0;
     use crate::machine_state::registers::a1;
     use crate::machine_state::registers::a2;
     use crate::machine_state::registers::fa0;
     use crate::machine_state::registers::nz;
     use crate::machine_state::registers::t1;
-    use crate::machine_state::registers::t3;
     use crate::parser::instruction::FenceSet;
     use crate::state::NewState;
-    use crate::traps::Exception;
 
     backend_test!(test_bitwise, F, {
         proptest!(|(val in any::<u64>(), imm in any::<u64>())| {
@@ -87,30 +85,6 @@ mod tests {
         })
     });
 
-    backend_test!(test_bitwise_reg, F, {
-        // TODO: RV-512: move to integer.rs once all are supported.
-        proptest!(|(v1 in any::<u64>(), v2 in any::<u64>())| {
-            let mut state = MachineCoreState::<M4K, F>::new();
-
-            state.hart.xregisters.write(a0, v1);
-            state.hart.xregisters.write(t3, v2);
-            run_and(&mut state, nz::t3, nz::a0, nz::a1);
-            prop_assert_eq!(state.hart.xregisters.read(a1), v1 & v2);
-
-            state.hart.xregisters.write(a0, v1);
-            state.hart.xregisters.write(t3, v2);
-            run_or(&mut state, nz::t3, nz::a0, nz::a0);
-            prop_assert_eq!(state.hart.xregisters.read(a0), v1 | v2);
-
-            // Same register
-            state.hart.xregisters.write(a0, v1);
-            run_and(&mut state, nz::a0, nz::a0, nz::a1);
-            prop_assert_eq!(state.hart.xregisters.read(a1), v1);
-            run_or(&mut state, nz::a0, nz::a0, nz::a1);
-            prop_assert_eq!(state.hart.xregisters.read(a1), v1);
-        });
-    });
-
     backend_test!(test_ebreak, F, {
         let state = MachineCoreState::<M4K, F>::new();
 
@@ -127,7 +101,7 @@ mod tests {
             succ in prop::array::uniform4(any::<bool>())
         )| {
             let mut state = state_cell.borrow_mut();
-            state.reset();
+            state.reset(NoopMemoryGovernanceListener);
 
             let pred = FenceSet { i: pred[0], o: pred[1], r: pred[2], w: pred[3] };
             let succ = FenceSet { i: succ[0], o: succ[1], r: succ[2], w: succ[3] };

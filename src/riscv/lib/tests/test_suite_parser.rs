@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: MIT
 
+// This ensures that Clippy does't apply rules which are allowed in tests.
+#![cfg(test)]
+
 use core::panic;
 use std::fs::DirEntry;
 use std::process::Command;
@@ -29,23 +32,23 @@ fn transform_objdump_instr<'a>(address: &'a str, instr: &'a str, args: &'a str) 
             let rs2 = args.next().unwrap();
             let branch_address = args.next().unwrap();
             let offset = compute_offset(address, branch_address);
-            format!("{} {},{},{}", op, rs1, rs2, offset)
+            format!("{op} {rs1},{rs2},{offset}")
         }
         "jal" => {
             let mut args = args.split(',');
             let rd = args.next().unwrap();
             let branch_address = args.next().unwrap();
             let offset = compute_offset(address, branch_address);
-            format!("{} {},{}", op, rd, offset)
+            format!("{op} {rd},{offset}")
         }
         "lr.w" | "lr.w.aq" | "lr.w.rl" | "lr.w.aqrl" | "lr.d" | "lr.d.aq" | "lr.d.rl"
         | "lr.d.aqrl" => {
             let args = args.replace(",(", ",zero,(");
-            format!("{} {}", op, args)
+            format!("{op} {args}")
         }
         "c.j" => {
             let offset = compute_offset(address, args);
-            format!("{} {}", op, offset)
+            format!("{op} {offset}")
         }
         "c.addi" => {
             let mut args = args.split(',');
@@ -55,7 +58,7 @@ fn transform_objdump_instr<'a>(address: &'a str, instr: &'a str, args: &'a str) 
                 // objdump seems to treat `c.nop` as a pseudoinstruction, but,
                 // unlike `nop`, the spec defines it as an instruction
                 ("zero", "0") => "c.nop".to_string(),
-                _ => format!("{} {},{}", op, rd_rs1, imm),
+                _ => format!("{op} {rd_rs1},{imm}"),
             }
         }
         "c.beqz" | "c.bnez" => {
@@ -63,13 +66,13 @@ fn transform_objdump_instr<'a>(address: &'a str, instr: &'a str, args: &'a str) 
             let rs1 = args.next().unwrap();
             let branch_address = args.next().unwrap();
             let offset = compute_offset(address, branch_address);
-            format!("{} {},{}", op, rs1, offset)
+            format!("{op} {rs1},{offset}")
         }
         _ => {
             if args.is_empty() {
                 op.to_string()
             } else {
-                format!("{} {}", op, args)
+                format!("{op} {args}")
             }
         }
     }
@@ -134,8 +137,7 @@ fn objdump(file_path: &str, disassembled: bool) -> Vec<(String, Instr, String)> 
     }
     assert!(
         !instructions.is_empty(),
-        "Could not extract any instructions from {}",
-        file_path
+        "Could not extract any instructions from {file_path}"
     );
     instructions
 }
@@ -169,9 +171,8 @@ fn check_hint_instr(objdump_instr: String) {
 }
 
 fn check_instructions(fname: &str, instructions: Vec<(String, Instr, String)>) {
-    use octez_riscv::parser::instruction::InstrCacheable;
     for (address, parsed_instr, objdump_instr) in instructions {
-        if let Instr::Cacheable(InstrCacheable::Hint { instr: _ }) = parsed_instr {
+        if let Instr::Hint { instr: _ } = parsed_instr {
             check_hint_instr(objdump_instr);
             continue;
         }
@@ -180,11 +181,7 @@ fn check_instructions(fname: &str, instructions: Vec<(String, Instr, String)>) {
         {
             continue;
         }
-        assert_eq!(
-            printed_instr, objdump_instr,
-            "{} at address {}",
-            fname, address
-        );
+        assert_eq!(printed_instr, objdump_instr, "{fname} at address {address}");
     }
 }
 
@@ -202,7 +199,7 @@ fn should_skip_rv_test(file: &DirEntry) -> bool {
 
 #[test]
 fn parser_riscv_test_suite() {
-    let tests_dir = "../assets/generated";
+    let tests_dir = "../../../assets/generated";
 
     for f in std::fs::read_dir(tests_dir).unwrap() {
         let file = f.unwrap();

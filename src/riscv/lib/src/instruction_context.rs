@@ -19,27 +19,22 @@ use rustc_apfloat::StatusAnd;
 use rustc_apfloat::ieee::Double;
 
 pub use self::value::StoreLoadInt;
+use crate::exceptions::Exception;
 use crate::instruction_context::value::PhiValue;
-use crate::interpreter::atomics::ReservationSetOption;
-use crate::interpreter::atomics::reset_reservation_set;
 use crate::interpreter::float::RoundingMode;
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::ProgramCounterUpdate;
-use crate::machine_state::csregisters::CSRRepr;
 use crate::machine_state::csregisters::CSRegister;
 use crate::machine_state::instruction::Args;
-use crate::machine_state::memory::Address;
 use crate::machine_state::memory::BadMemoryAccess;
 use crate::machine_state::memory::Memory;
 use crate::machine_state::memory::MemoryConfig;
-use crate::machine_state::registers::FRegister;
 use crate::machine_state::registers::FValue;
 use crate::machine_state::registers::XValue;
 use crate::machine_state::registers::XValue32;
 use crate::parser::instruction::InstrWidth;
 use crate::state_backend::ManagerReadWrite;
 use crate::state_context::StateContext;
-use crate::traps::Exception;
 
 /// Type of function that may be used to lower [`Instructions`] to IR.
 ///
@@ -52,7 +47,34 @@ pub type IcbFnResult<I> = <I as ICB>::IResult<ProgramCounterUpdate<<I as ICB>::X
 /// Instruction Context Builder contains operations required to
 /// execute RISC-V instructions.
 #[expect(clippy::upper_case_acronyms, reason = "ICB looks cooler than Icb")]
-pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
+pub(crate) trait ICB
+where
+    // These constraints let us tie a type-equality knot.
+    //
+    // We want to allow handling of arbitrary value types via [`StateContext`]'s associated type
+    // `Value`, whilst adding functionality on a subset of those values (e.g. 64-bit and 32-bit
+    // integers, and floating-point numbers).
+    //
+    // There are two ways one can achieve this:
+    //
+    // 1. Define associated types with those additional constraints (those bring the additional
+    //    functionality into scope). Then force each specific `Self::Value<_>` to be equal to the
+    //    new associated types.
+    //
+    // 2. Constrain the instantiated `Self::Value<_>` directly.
+    //
+    // The second approach would be nicer, if it weren't for Rust's inability to express constraints
+    // on associated types like super-trait relationships. This means, if you use `ICB` as a
+    // constraint, you also need to express all its inherited constraints on the associated types
+    // of `StateContext` in the trait bounds. This results in massive amount of boilerplate being
+    // added everywhere. Imagine how many ICB-style instruction implementations there are that
+    // mention `ICB` in their trait bounds.
+    // Because of this, we use the first approach, which is more verbose with respect to the number
+    // of types being declared, but is equally as powerful.
+    Self: StateContext<Value<u64> = Self::XValue>
+        + StateContext<Value<u32> = Self::XValue32>
+        + StateContext<Value<FValue> = Self::FValue>,
+{
     /// A 64-bit value stored in [`XRegisters`].
     ///
     /// [`XRegisters`]: crate::machine_state::registers::XRegisters
@@ -68,12 +90,6 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
 
     /// Construct an [`ICB::XValue32`] from an `imm: i32`.
     fn xvalue32_of_imm(&mut self, imm: i32) -> Self::XValue32;
-
-    #[expect(unused, reason = "Will Be Used Soon™")]
-    fn fregister_read(&mut self, reg: FRegister) -> Self::FValue;
-
-    /// Perform a write to a [`FRegister`], with the given value.
-    fn fregister_write(&mut self, reg: FRegister, value: Self::FValue);
 
     /// Perform a read of the program counter.
     fn pc_read(&mut self) -> Self::XValue;
@@ -126,6 +142,12 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
         instr_width: InstrWidth,
     ) -> ProgramCounterUpdate<Self::XValue>;
 
+    /// Run the IR code produced by the `true_branch` if `cond` is true. If the condition is false,
+    /// the IR code following this call will be executed instead.
+    fn if_then<OnTrue>(&mut self, cond: Self::Bool, true_branch: OnTrue) -> Self::IResult<()>
+    where
+        OnTrue: FnOnce(&mut Self) -> Self::IResult<()>;
+
     /// Take a branch based on the given condition and return to a common line of execution.
     ///
     /// This is used for situations where we have a common execution path following branching.
@@ -134,7 +156,7 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
     ///
     /// Semantically, this function returns the caller into the context of the common
     /// execution path with the resulting value of the branch that was taken.
-    fn branch_merge<Phi: PhiValue, OnTrue, OnFalse>(
+    fn if_then_else<Phi: PhiValue, OnTrue, OnFalse>(
         &mut self,
         cond: Self::Bool,
         true_branch: OnTrue,
@@ -150,16 +172,8 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
     /// Wrap a value as a fallible value.
     fn ok<Value>(&mut self, val: Value) -> Self::IResult<Value>;
 
-    /// Raise an [`Exception::IllegalInstruction`] error.
-    fn err_illegal_instruction<In>(&mut self) -> Self::IResult<In>;
-
-    /// Raise an [`Exception::StoreAMOAccessFault`] error if `address` is not
-    /// aligned to the given [`LoadStoreWidth`].
-    fn atomic_access_fault_guard<V: StoreLoadInt>(
-        &mut self,
-        address: Self::XValue,
-        reservation_set_option: ReservationSetOption,
-    ) -> Self::IResult<()>;
+    /// Raise an exception, returning a fallible value.
+    fn raise_exception<In>(&mut self, exception: Exception) -> Self::IResult<In>;
 
     /// Map the fallible-value into a fallible-value of a different type.
     fn map<Value, Next, F>(res: Self::IResult<Value>, f: F) -> Self::IResult<Next>
@@ -170,9 +184,6 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
     fn and_then<Value, Next, F>(res: Self::IResult<Value>, f: F) -> Self::IResult<Next>
     where
         F: FnOnce(Value) -> Self::IResult<Next>;
-
-    /// Exception to perform an ECall at the current mode
-    fn ecall(&mut self) -> Self::IResult<ProgramCounterUpdate<Self::XValue>>;
 
     /// Write value to main memory, at the given address.
     ///
@@ -193,7 +204,7 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
 
     /// Take an `XValue` and convert it to a 64-bit float with the dynamic rounding mode in the `frm` field of the
     /// `fcsr` register, returning the result as an `FValue`.
-    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::IResult<Self::FValue>;
+    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::FValue;
 
     /// Take an `XValue` and a static rounding mode, and convert it to a 64-bit float
     /// with the given rounding mode, returning the resulting `FValue`.
@@ -202,6 +213,12 @@ pub(crate) trait ICB: StateContext<X64 = Self::XValue> {
         xval: Self::XValue,
         rm: RoundingMode,
     ) -> Self::FValue;
+
+    /// Read the value from a Control and Status register.
+    fn csr_read(&mut self, reg: CSRegister) -> Self::XValue;
+
+    /// Write a value to a Control and Status register.
+    fn csr_write(&mut self, reg: CSRegister, value: Self::XValue);
 }
 
 impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
@@ -216,16 +233,6 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
 
     fn xvalue32_of_imm(&mut self, imm: i32) -> Self::XValue32 {
         imm as u32
-    }
-
-    #[inline(always)]
-    fn fregister_read(&mut self, reg: FRegister) -> Self::FValue {
-        self.hart.fregisters.read(reg)
-    }
-
-    #[inline(always)]
-    fn fregister_write(&mut self, reg: FRegister, value: Self::FValue) {
-        self.hart.fregisters.write(reg, value)
     }
 
     #[inline(always)]
@@ -295,8 +302,20 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         }
     }
 
+    #[inline]
+    fn if_then<OnTrue>(&mut self, cond: Self::Bool, true_branch: OnTrue) -> Self::IResult<()>
+    where
+        OnTrue: FnOnce(&mut Self) -> Self::IResult<()>,
+    {
+        if cond {
+            return true_branch(self);
+        }
+
+        Ok(())
+    }
+
     #[inline(always)]
-    fn branch_merge<Phi: PhiValue, OnTrue, OnFalse>(
+    fn if_then_else<Phi: PhiValue, OnTrue, OnFalse>(
         &mut self,
         cond: Self::Bool,
         true_branch: OnTrue,
@@ -313,26 +332,6 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         }
     }
 
-    #[inline(always)]
-    fn atomic_access_fault_guard<V: StoreLoadInt>(
-        &mut self,
-        address: Address,
-        reservation_set_option: ReservationSetOption,
-    ) -> Self::IResult<()> {
-        let width = self.xvalue_of_imm(V::WIDTH as i64);
-        let remainder = address.modulus_unsigned(width, self);
-        let zero = self.xvalue_of_imm(0);
-
-        if remainder.compare(zero, Predicate::NotEqual, self) {
-            if let ReservationSetOption::Reset = reservation_set_option {
-                reset_reservation_set(self);
-            }
-            Err(Exception::StoreAMOAccessFault(address))
-        } else {
-            Ok(())
-        }
-    }
-
     type IResult<In> = Result<In, Exception>;
 
     #[inline(always)]
@@ -340,9 +339,9 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         Ok(val)
     }
 
-    #[inline(always)]
-    fn err_illegal_instruction<In>(&mut self) -> Self::IResult<In> {
-        Err(Exception::IllegalInstruction)
+    #[inline]
+    fn raise_exception<In>(&mut self, exception: Exception) -> Self::IResult<In> {
+        Err(exception)
     }
 
     #[inline(always)]
@@ -361,10 +360,6 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         res.and_then(f)
     }
 
-    fn ecall(&mut self) -> Self::IResult<ProgramCounterUpdate<Self::XValue>> {
-        Err(Exception::EnvCall)
-    }
-
     #[inline(always)]
     fn main_memory_store<V: StoreLoadInt>(
         &mut self,
@@ -373,7 +368,7 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
     ) -> Self::IResult<()> {
         self.main_memory
             .write(address, V::from_xvalue(value))
-            .map_err(|_: BadMemoryAccess| Exception::StoreAMOAccessFault(address))
+            .map_err(|_: BadMemoryAccess| Exception::StoreAMOAccessFault)
     }
 
     #[inline(always)]
@@ -384,7 +379,7 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         self.main_memory
             .read(address)
             .map(V::to_xvalue)
-            .map_err(|_: BadMemoryAccess| Exception::LoadAccessFault(address))
+            .map_err(|_: BadMemoryAccess| Exception::LoadAccessFault)
     }
 
     fn f64_from_x64_unsigned_static(
@@ -397,27 +392,31 @@ impl<MC: MemoryConfig, M: ManagerReadWrite> ICB for MachineCoreState<MC, M> {
         let StatusAnd { status, value } = Double::from_u128_r(extended, rm.into());
 
         if status != Status::OK {
-            self.hart.csregisters.set_exception_flag_status(status);
+            self.hart.csregisters.import_float_exception_flags(status);
         }
 
         value.into()
     }
 
-    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::IResult<Self::FValue> {
+    fn f64_from_x64_unsigned_dynamic(&mut self, xval: Self::XValue) -> Self::FValue {
         let extended = xval as u128;
-        let rm: RoundingMode = self
-            .hart
-            .csregisters
-            .read::<CSRRepr>(CSRegister::frm)
-            .try_into()?;
+        let rm: RoundingMode = self.hart.csregisters.frm.read();
 
         let StatusAnd { status, value } = Double::from_u128_r(extended, rm.into());
 
         if status != Status::OK {
-            self.hart.csregisters.set_exception_flag_status(status);
+            self.hart.csregisters.import_float_exception_flags(status);
         }
 
-        Ok(value.into())
+        FValue::from(value)
+    }
+
+    fn csr_read(&mut self, reg: CSRegister) -> Self::XValue {
+        self.hart.csregisters.read(reg)
+    }
+
+    fn csr_write(&mut self, reg: CSRegister, value: Self::XValue) {
+        self.hart.csregisters.write(reg, value);
     }
 }
 

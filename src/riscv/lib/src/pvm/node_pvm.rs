@@ -3,17 +3,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-use std::fmt;
 use std::ops::Bound;
 use std::path::Path;
 
+use perfect_derive::perfect_derive;
 use thiserror::Error;
 
 use super::Pvm;
 use super::PvmLayout;
-use crate::machine_state::block_cache::TestCacheConfig;
-use crate::machine_state::block_cache::block::Interpreted;
-use crate::machine_state::block_cache::block::InterpretedBlockBuilder;
+use crate::machine_state::page_cache::InterpretedCompiler;
+use crate::machine_state::page_cache::interpreted::Interpreted;
 use crate::program::Program;
 use crate::pvm::InputRequest;
 use crate::pvm::common::PvmInput;
@@ -41,10 +40,13 @@ pub enum PvmError {
 
 type NodePvmMemConfig = crate::machine_state::memory::M64M;
 
-pub(crate) type NodePvmLayout = PvmLayout<NodePvmMemConfig, TestCacheConfig>;
+pub(crate) type NodePvmLayout = PvmLayout<NodePvmMemConfig>;
 
-type NodePvmState<M> = Pvm<NodePvmMemConfig, TestCacheConfig, Interpreted<NodePvmMemConfig, M>, M>;
+type NodePvmState<M> = Pvm<NodePvmMemConfig, Interpreted<NodePvmMemConfig, M>, M>;
 
+#[perfect_derive(Clone)]
+#[derive(derive_more::Debug)]
+#[debug("NodePvm(<unknown state>)")]
 pub struct NodePvm<M: state_backend::ManagerBase = Owned> {
     state: Box<NodePvmState<M>>,
 }
@@ -54,7 +56,7 @@ impl<M: state_backend::ManagerBase> NodePvm<M> {
     where
         M::ManagerRoot: state_backend::ManagerReadWrite,
     {
-        let state = NodePvmState::<M>::bind(space, InterpretedBlockBuilder);
+        let state = NodePvmState::<M>::bind(space, InterpretedCompiler);
         Self {
             state: Box::new(state),
         }
@@ -121,8 +123,9 @@ impl<M: state_backend::ManagerBase> NodePvm<M> {
         M: state_backend::ManagerReadWrite,
     {
         self.with_backend_mut(|pvm| {
-            let program = Program::from_elf(kernel).unwrap();
-            pvm.setup_linux_process(&program).unwrap()
+            let program = Program::from_elf(kernel).expect("Failed to parse boot sector ELF");
+            pvm.setup_linux_process(&program)
+                .expect("Failed to setup the machine with the boot sector");
         })
     }
 
@@ -170,7 +173,7 @@ impl NodePvm {
 
     /// Compute the root hash of the PVM state.
     pub fn hash(&self) -> Hash {
-        self.with_backend(|pvm| pvm.hash().unwrap())
+        self.with_backend(|pvm| pvm.hash().expect("Failed to compute PVM state hash"))
     }
 
     /// Produce the Merkle proof corresponding to the next step of the PVM.
@@ -230,27 +233,6 @@ impl NodePvm<Verifier> {
     }
 }
 
-impl<M: state_backend::ManagerSerialise> fmt::Debug for NodePvm<M> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let refs = self.state.struct_ref::<state_backend::FnManagerIdent>();
-        let rendered = if f.alternate() {
-            serde_json::to_string_pretty(&refs)
-        } else {
-            serde_json::to_string(&refs)
-        }
-        .expect("Could not serialize PVM state");
-        f.write_str(&rendered)
-    }
-}
-
-impl<M: state_backend::ManagerClone> Clone for NodePvm<M> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-        }
-    }
-}
-
 impl PartialEq for NodePvm {
     fn eq(&self, other: &Self) -> bool {
         self.state.struct_ref::<state_backend::FnManagerIdent>()
@@ -266,7 +248,7 @@ impl<M: state_backend::ManagerBase> NewState<M> for NodePvm<M> {
         M: state_backend::ManagerAlloc,
     {
         Self {
-            state: Box::new(NodePvmState::<M>::new(InterpretedBlockBuilder)),
+            state: Box::new(NodePvmState::<M>::new(InterpretedCompiler)),
         }
     }
 }

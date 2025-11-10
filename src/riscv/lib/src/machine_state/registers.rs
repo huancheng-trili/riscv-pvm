@@ -14,12 +14,17 @@
 )]
 
 use std::fmt;
+use std::mem::Discriminant;
 use std::num::NonZeroUsize;
 
 use arbitrary_int::u5;
+use bincode::Decode;
+use bincode::Encode;
+use perfect_derive::perfect_derive;
 
 use crate::default::ConstDefault;
 use crate::instruction_context::ICB;
+use crate::jit::builder::typed;
 use crate::machine_state::backend;
 use crate::state::NewState;
 use crate::state_backend::CellsProj;
@@ -32,24 +37,17 @@ use crate::state_context::projection::impl_projection;
 #[expect(non_camel_case_types, reason = "Consistent with RISC-V spec")]
 #[repr(u8)]
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    strum::EnumIter,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, strum::EnumIter,
 )]
 pub enum XRegister {
     // The `usize` representation of these constructors shall be used as an
     // index into the 31-element array holding the registers.
     // x0 represents no entry in this array because it is handled separately.
     // Therefore we assign a dummy index to x0.
-    x0 = u8::MAX,
+    //
+    // XXX: The derivers for Encode/Decode don't seem to be able to parse expressions in variant
+    // discriminants correctly. Hence we're using `255u8` instead of `u8::MAX` as the value for `x0`.
+    x0 = 255u8,
     x1 = 0,
     x2,
     x3,
@@ -197,6 +195,7 @@ pub type XValue32 = u32;
 pub type XRegistersLayout = backend::Array<XValue, 31>;
 
 /// Integer registers
+#[perfect_derive(Clone)]
 pub struct XRegisters<M: backend::ManagerBase> {
     registers: backend::Cells<XValue, 31, M>,
 }
@@ -299,29 +298,11 @@ impl<M: backend::ManagerBase> NewState<M> for XRegisters<M> {
     }
 }
 
-impl<M: backend::ManagerClone> Clone for XRegisters<M> {
-    fn clone(&self) -> Self {
-        Self {
-            registers: self.registers.clone(),
-        }
-    }
-}
-
 /// Register index for integer registers known from the opcode to be `!=x0`.
 #[expect(non_camel_case_types, reason = "Consistent with RISC-V spec")]
 #[repr(u8)]
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    strum::EnumIter,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, strum::EnumIter,
 )]
 pub enum NonZeroXRegister {
     // This enum represents XRegisters known from the opcode to be `!=x0`, hence omitting
@@ -382,6 +363,19 @@ impl NonZeroXRegister {
     }
 }
 
+impl TryFrom<XRegister> for NonZeroXRegister {
+    type Error = ();
+
+    fn try_from(r: XRegister) -> Result<Self, Self::Error> {
+        match r {
+            x0 => Err(()),
+            // SAFETY: Excluding x0, XRegister is a
+            // direct map to NonZeroXRegister, so safe to convert.
+            r => unsafe { Ok(std::mem::transmute::<XRegister, Self>(r)) },
+        }
+    }
+}
+
 /// ABI register names for NonZeroXRegister types used in backend tests.
 pub mod nz {
     use super::NonZeroXRegister;
@@ -424,17 +418,7 @@ pub mod nz {
 #[expect(non_camel_case_types, reason = "Consistent with RISC-V spec")]
 #[repr(u8)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    strum::EnumIter,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumIter, Hash, Encode, Decode,
 )]
 pub enum FRegister {
     f0 = 0,
@@ -557,6 +541,16 @@ impl fmt::Display for FRegister {
     }
 }
 
+impl typed::Typed for FRegister {
+    const TYPE: typed::Type = {
+        if std::mem::size_of::<Discriminant<Self>>() != 1 {
+            panic!("FRegister is expected to be equal to u8");
+        }
+
+        typed::Type::Basic(cranelift::prelude::types::I8)
+    };
+}
+
 /// Floating-point number register value
 #[repr(transparent)]
 #[derive(
@@ -570,8 +564,8 @@ impl fmt::Display for FRegister {
     Debug,
     derive_more::From,
     derive_more::Into,
-    serde::Serialize,
-    serde::Deserialize,
+    Encode,
+    Decode,
 )]
 pub struct FValue(u64);
 
@@ -580,9 +574,9 @@ impl ConstDefault for FValue {
 }
 
 impl FValue {
-    /// Convert to [`f64`] bitwise.
-    pub(crate) fn bits(self) -> f64 {
-        f64::from_bits(self.0)
+    /// Extract the raw bits of FValue to [`u64`].
+    pub(crate) fn bits(self) -> u64 {
+        self.0
     }
 }
 
@@ -602,10 +596,21 @@ impl backend::Elem for FValue {
     }
 }
 
+impl typed::Typed for FValue {
+    const TYPE: typed::Type = {
+        if std::mem::size_of::<FValue>() != std::mem::size_of::<u64>() {
+            panic!("FValue must be represented as u64");
+        }
+
+        typed::Type::Basic(cranelift::prelude::types::I64)
+    };
+}
+
 /// Layout for [FRegisters]
 pub type FRegistersLayout = backend::Array<FValue, 32>;
 
 /// Floating-point number registers
+#[perfect_derive(Clone)]
 pub struct FRegisters<M: backend::ManagerBase> {
     registers: backend::Cells<FValue, 32, M>,
 }
@@ -664,14 +669,6 @@ impl<M: backend::ManagerBase> NewState<M> for FRegisters<M> {
     }
 }
 
-impl<M: backend::ManagerClone> Clone for FRegisters<M> {
-    fn clone(&self) -> Self {
-        Self {
-            registers: self.registers.clone(),
-        }
-    }
-}
-
 impl_projection! {
     projection XRegisterProj {
         subject = MachineCoreCons,
@@ -685,7 +682,7 @@ impl_projection! {
 pub fn read_xregister_nz<SC: StateContext + ?Sized>(
     state: &mut SC,
     reg: NonZeroXRegister,
-) -> SC::X64 {
+) -> SC::Value<XValue> {
     state.read_proj::<XRegisterProj>((reg as usize,))
 }
 
@@ -694,7 +691,7 @@ pub fn read_xregister_nz<SC: StateContext + ?Sized>(
 pub fn write_xregister_nz<SC: StateContext + ?Sized>(
     state: &mut SC,
     reg: NonZeroXRegister,
-    value: SC::X64,
+    value: SC::Value<XValue>,
 ) {
     state.write_proj::<XRegisterProj>((reg as usize,), value)
 }
@@ -719,9 +716,29 @@ pub fn write_xregister<I: ICB + ?Sized>(icb: &mut I, reg: XRegister, value: I::X
     icb.write_proj::<XRegisterProj>((reg as usize,), value)
 }
 
+impl_projection! {
+    projection FRegisterProj {
+        subject = MachineCoreCons,
+        target_projection = CellsProj<FValue, 32>,
+        path = hart.fregisters.registers,
+    }
+}
+
+/// Read from a floating-point number register.
+#[inline]
+pub fn read_fregister<I: ICB>(icb: &mut I, reg: FRegister) -> I::FValue {
+    icb.read_proj::<FRegisterProj>((reg as usize,))
+}
+
+/// Write to a floating-point number register.
+#[inline]
+pub fn write_fregister<I: ICB>(icb: &mut I, reg: FRegister, value: I::FValue) {
+    icb.write_proj::<FRegisterProj>((reg as usize,), value)
+}
+
 #[cfg(test)]
 mod tests {
-    use arbitrary_int::Number;
+    use arbitrary_int::traits::Integer;
     use strum::IntoEnumIterator;
 
     use super::*;

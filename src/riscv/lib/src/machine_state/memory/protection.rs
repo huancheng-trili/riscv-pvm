@@ -2,7 +2,18 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::ops::RangeInclusive;
+
+use bincode::Decode;
+use bincode::Encode;
+use bincode::de::Decoder;
+use bincode::enc::Encoder;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
+use perfect_derive::perfect_derive;
+
 use super::Address;
+use super::address_to_page_index;
 use crate::array_utils::boxed_from_fn;
 use crate::state::NewState;
 use crate::state_backend::AllocatedOf;
@@ -11,7 +22,6 @@ use crate::state_backend::Cell;
 use crate::state_backend::FnManager;
 use crate::state_backend::ManagerAlloc;
 use crate::state_backend::ManagerBase;
-use crate::state_backend::ManagerClone;
 use crate::state_backend::ManagerDeserialise;
 use crate::state_backend::ManagerRead;
 use crate::state_backend::ManagerSerialise;
@@ -24,6 +34,7 @@ use crate::state_backend::Ref;
 pub type PagePermissionsLayout<const PAGES: usize> = Many<Atom<bool>, PAGES>;
 
 /// Tracks access permissions for each page
+#[perfect_derive(Clone)]
 pub struct PagePermissions<const PAGES: usize, M: ManagerBase> {
     pages: Box<[Cell<bool, M>; PAGES]>,
 }
@@ -56,23 +67,12 @@ impl<const PAGES: usize, M: ManagerBase> PagePermissions<PAGES, M> {
     /// The address and length must be valid for an address space consisting of a number of `PAGES`.
     /// This function is not defined for address and length combinations which are out of bounds.
     #[inline]
-    pub unsafe fn can_access(&self, address: Address, length: usize) -> bool
+    pub unsafe fn can_access(&self, pages: RangeInclusive<u64>) -> bool
     where
         M: ManagerRead,
     {
-        // Zero-sized accesses are always valid
-        if length < 1 {
-            return true;
-        }
-
-        let address = address as usize;
-
-        // Extract the page index range from using the start and end addresses
-        let start_page = address >> super::OFFSET_BITS;
-        let end_page = address.wrapping_add(length).wrapping_sub(1) >> super::OFFSET_BITS;
-
-        for page in start_page..=end_page {
-            if unsafe { !self.pages.get_unchecked(page).read() } {
+        for page in pages {
+            if unsafe { !self.pages.get_unchecked(page as usize).read() } {
                 return false;
             }
         }
@@ -94,36 +94,35 @@ impl<const PAGES: usize, M: ManagerBase> PagePermissions<PAGES, M> {
         E: NarrowlySized,
         M: ManagerRead,
     {
-        let address = address as usize;
-
-        let start_page = address >> super::OFFSET_BITS;
+        let start_page = address_to_page_index(address);
         if unsafe { !self.pages.get_unchecked(start_page).read() } {
             return false;
         }
 
-        let end_page =
-            address.wrapping_add(E::NARROW_SIZE.get()).wrapping_sub(1) >> super::OFFSET_BITS;
+        let end_address = address
+            .wrapping_add(E::NARROW_SIZE.get() as Address)
+            .wrapping_sub(1);
+
+        let end_page = address_to_page_index(end_address);
         unsafe { self.pages.get_unchecked(end_page).read() }
     }
 
     /// Change the access permissions for the given range.
-    pub fn modify_access(&mut self, address: Address, length: usize, accessible: bool)
+    pub fn modify_access(&mut self, pages: RangeInclusive<u64>, accessible: bool)
     where
         M: ManagerWrite,
     {
-        if length < 1 {
-            return;
-        }
+        pages.filter(|&page| page < PAGES as u64).for_each(|page| {
+            self.pages[page as usize].write(accessible);
+        })
+    }
 
-        let address = address as usize;
-        let start_page = address >> super::OFFSET_BITS;
-        let end_page = address.wrapping_add(length).wrapping_sub(1) >> super::OFFSET_BITS;
-
-        (start_page..=end_page)
-            .filter(|&page| page < PAGES)
-            .for_each(|page| {
-                self.pages[page].write(accessible);
-            })
+    /// Reset access permissions on all pages.
+    pub fn reset(&mut self)
+    where
+        M: ManagerWrite,
+    {
+        self.pages.iter_mut().for_each(|page| page.write(false));
     }
 }
 
@@ -138,32 +137,15 @@ impl<const PAGES: usize, M: ManagerBase> NewState<M> for PagePermissions<PAGES, 
     }
 }
 
-impl<'de, const PAGES: usize, M: ManagerDeserialise> serde::Deserialize<'de>
-    for PagePermissions<PAGES, M>
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(Self::bind(
-            <AllocatedOf<PagePermissionsLayout<PAGES>, M>>::deserialize(deserializer)?,
-        ))
+impl<const PAGES: usize, M: ManagerDeserialise> Decode<()> for PagePermissions<PAGES, M> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let pages: AllocatedOf<PagePermissionsLayout<PAGES>, M> = Decode::decode(decoder)?;
+        Ok(Self::bind(pages))
     }
 }
 
-impl<const PAGES: usize, M: ManagerSerialise> serde::Serialize for PagePermissions<PAGES, M> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.pages.serialize(serializer)
-    }
-}
-
-impl<const PAGES: usize, M: ManagerClone> Clone for PagePermissions<PAGES, M> {
-    fn clone(&self) -> Self {
-        Self {
-            pages: self.pages.clone(),
-        }
+impl<const PAGES: usize, M: ManagerSerialise> Encode for PagePermissions<PAGES, M> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.pages.encode(encoder)
     }
 }

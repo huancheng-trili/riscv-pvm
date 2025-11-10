@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2023 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2023,2025 TriliTech <contact@trili.tech>
 // SPDX-FileCopyrightText: 2024-2025 Nomadic Labs <contact@nomadic-labs.com>
 //
 // SPDX-License-Identifier: MIT
@@ -6,8 +6,14 @@
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use super::EnrichedValue;
-use super::EnrichedValueLinked;
+use bincode::Decode;
+use bincode::Encode;
+use bincode::de::Decoder;
+use bincode::enc::Encoder;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
+use perfect_derive::perfect_derive;
+
 use super::FnManager;
 use super::ManagerAlloc;
 use super::ManagerBase;
@@ -30,166 +36,10 @@ use crate::state_context::projection::ApplyCons;
 use crate::state_context::projection::CellCons;
 use crate::state_context::projection::CellsCons;
 use crate::state_context::projection::Projection;
-
-/// Link a stored value directly with a derived value -
-/// that would either be expensive to compute each time, or cannot
-/// itself be stored.
-///
-/// Only the value of `V::E` forms part of the 'state' for the purposes of commitments etc.
-pub struct EnrichedCell<V: EnrichedValue, M: ManagerBase> {
-    cell: M::EnrichedCell<V>,
-}
-
-impl<V: EnrichedValue, M: ManagerBase> EnrichedCell<V, M> {
-    /// Allocate a new enriched cell with the given value.
-    pub fn new_with(value: V::E) -> Self
-    where
-        M: ManagerAlloc,
-        V: EnrichedValueLinked,
-    {
-        let region = M::allocate_region([value]);
-        let cell = M::enrich_cell(region);
-        Self { cell }
-    }
-
-    /// Bind this state to the enriched cell.
-    pub fn bind(cell: Cell<V::E, M>) -> Self
-    where
-        V: EnrichedValueLinked,
-    {
-        let region = cell.into_region();
-        let cell = M::enrich_cell(region);
-        Self { cell }
-    }
-
-    /// Obtain a reference to the underlying cell.
-    pub fn cell_ref(&self) -> &M::EnrichedCell<V> {
-        &self.cell
-    }
-
-    /// Given a manager morphism `f : &M -> N`, return the layout's allocated structure containing
-    /// the constituents of `N` that were produced from the constituents of `&M`.
-    pub fn struct_ref<'a, F: FnManager<Ref<'a, M>>>(&'a self) -> Cell<V::E, F::Output> {
-        let cell = self.cell_ref();
-        let region = M::as_devalued_cell(cell);
-        let region = F::map_region(region);
-        Cell::bind(region)
-    }
-
-    /// Write the value back to the enriched cell.
-    ///
-    /// Reading the new value will produce the new derived value also.
-    pub fn write(&mut self, value: V::E)
-    where
-        M: ManagerWrite,
-        V: EnrichedValueLinked,
-    {
-        M::enriched_cell_write(&mut self.cell, value)
-    }
-
-    /// Read the stored value from the enriched cell.
-    pub fn read_stored(&self) -> V::E
-    where
-        M: ManagerRead,
-        V::E: Copy,
-    {
-        M::enriched_cell_read_stored(&self.cell)
-    }
-
-    /// Read the derived value from the enriched cell.
-    pub fn read_derived(&self) -> V::D
-    where
-        M: ManagerRead,
-        V: EnrichedValueLinked,
-        V::D: Copy,
-    {
-        M::enriched_cell_read_derived(&self.cell)
-    }
-
-    /// Obtain a reference to the value contained within the cell.
-    pub fn read_ref_stored(&self) -> &V::E
-    where
-        M: ManagerRead,
-    {
-        M::enriched_cell_ref_stored(&self.cell)
-    }
-}
-
-impl<V: EnrichedValue, M: ManagerBase> NewState<M> for EnrichedCell<V, M>
-where
-    V: EnrichedValueLinked,
-    V::E: ConstDefault,
-{
-    fn new() -> Self
-    where
-        M: ManagerAlloc,
-    {
-        Self::new_with(<V::E as ConstDefault>::DEFAULT)
-    }
-}
-
-impl<V: EnrichedValue, M: ManagerClone> Clone for EnrichedCell<V, M>
-where
-    V::E: Clone,
-    V::D: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            cell: M::clone_enriched_cell(&self.cell),
-        }
-    }
-}
-
-impl<V, M: ManagerRead> PartialEq for EnrichedCell<V, M>
-where
-    V: EnrichedValueLinked,
-    V::E: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        M::enriched_cell_ref_stored(&self.cell) == M::enriched_cell_ref_stored(&other.cell)
-    }
-}
-
-impl<V: EnrichedValue, M: ManagerSerialise> serde::Serialize for EnrichedCell<V, M>
-where
-    V::E: serde::Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let cell = self.cell_ref();
-        let region = M::as_devalued_cell(cell);
-        M::serialise_region(region, serializer)
-    }
-}
-
-impl<V: EnrichedValue, M: ManagerSerialise> AccessInfoAggregatable
-    for EnrichedCell<V, Ref<'_, ProofGen<M>>>
-where
-    V::E: serde::Serialize,
-{
-    fn aggregate_access_info(&self) -> bool {
-        self.cell.get_access_info()
-    }
-}
-
-impl<'de, V, M: ManagerDeserialise> serde::Deserialize<'de> for EnrichedCell<V, M>
-where
-    V: EnrichedValueLinked,
-    V::E: serde::Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let region = M::deserialise_region(deserializer)?;
-        let cell = M::enrich_cell(region);
-        Ok(Self { cell })
-    }
-}
+use crate::state_context::projection::ProjectionOffset;
 
 /// Single element of type `E`
+#[perfect_derive(Clone)]
 #[repr(transparent)]
 pub struct Cell<E: 'static, M: ManagerBase> {
     region: Cells<E, 1, M>,
@@ -272,23 +122,15 @@ impl<E: 'static, M: ManagerBase> From<Cells<E, 1, M>> for Cell<E, M> {
     }
 }
 
-impl<E: serde::Serialize, M: ManagerSerialise> serde::Serialize for Cell<E, M> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.region.serialize(serializer)
+impl<T: Encode, M: ManagerSerialise> Encode for Cell<T, M> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.region.encode(encoder)
     }
 }
 
-impl<'de, E: serde::Deserialize<'de>, M: ManagerDeserialise> serde::Deserialize<'de>
-    for Cell<E, M>
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let region = Cells::deserialize(deserializer)?;
+impl<E: Decode<()>, M: ManagerDeserialise> Decode<()> for Cell<E, M> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let region = Decode::decode(decoder)?;
         Ok(Self { region })
     }
 }
@@ -299,21 +141,11 @@ impl<A: PartialEq<B>, B, M: ManagerRead, N: ManagerRead> PartialEq<Cell<B, N>> f
     }
 }
 
-impl<E: serde::Serialize, M: ManagerSerialise> AccessInfoAggregatable
-    for Cell<E, Ref<'_, ProofGen<M>>>
-{
-    fn aggregate_access_info(&self) -> bool {
-        self.region.region.get_access_info()
-    }
-}
-
 impl<E: Eq, M: ManagerRead> Eq for Cell<E, M> {}
 
-impl<E: Clone, M: ManagerClone> Clone for Cell<E, M> {
-    fn clone(&self) -> Self {
-        Self {
-            region: self.region.clone(),
-        }
+impl<E: Encode, M: ManagerSerialise> AccessInfoAggregatable for Cell<E, Ref<'_, ProofGen<M>>> {
+    fn aggregate_access_info(&self) -> bool {
+        self.region.region.get_access_info()
     }
 }
 
@@ -371,11 +203,10 @@ impl<E: 'static> Projection for CellProj<E> {
         state.write(value);
     }
 
-    fn owned_pointer_offset<MC: MemoryConfig>(_param: Self::Parameter) -> i32 {
-        let field_offset: i32 = std::mem::offset_of!(Cell<E, Owned>, region.region)
-            .try_into()
-            .expect("Field offset exceeds i32 range");
-        field_offset + RegionProj::<E, 1>::owned_pointer_offset::<MC>((0,))
+    fn owned_pointer_offset<MC: MemoryConfig>(_param: Self::Parameter) -> ProjectionOffset {
+        let field_offset = std::mem::offset_of!(Cell<E, Owned>, region.region);
+
+        RegionProj::<E, 1>::owned_pointer_offset::<MC>((0,)) + field_offset
     }
 }
 
@@ -485,25 +316,15 @@ impl<E: ConstDefault + 'static, const LEN: usize, M: ManagerBase> NewState<M> fo
     }
 }
 
-impl<E: serde::Serialize, const LEN: usize, M: ManagerSerialise> serde::Serialize
-    for Cells<E, LEN, M>
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        M::serialise_region(&self.region, serializer)
+impl<T: Encode, const LEN: usize, M: ManagerSerialise> Encode for Cells<T, LEN, M> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        M::serialise_region(&self.region, encoder)
     }
 }
 
-impl<'de, E: serde::Deserialize<'de>, const LEN: usize, M: ManagerDeserialise>
-    serde::Deserialize<'de> for Cells<E, LEN, M>
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let region = M::deserialise_region(deserializer)?;
+impl<E: Decode<()>, const LEN: usize, M: ManagerDeserialise> Decode<()> for Cells<E, LEN, M> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let region = M::deserialise_region(decoder)?;
         Ok(Self { region })
     }
 }
@@ -516,7 +337,7 @@ impl<A: PartialEq<B> + Copy, B: Copy, const LEN: usize, M: ManagerRead, N: Manag
     }
 }
 
-impl<E: serde::Serialize, const LEN: usize, M: ManagerSerialise> AccessInfoAggregatable
+impl<E: Encode, const LEN: usize, M: ManagerSerialise> AccessInfoAggregatable
     for Cells<E, LEN, Ref<'_, ProofGen<M>>>
 {
     fn aggregate_access_info(&self) -> bool {
@@ -570,45 +391,74 @@ impl<E: 'static, const LEN: usize> Projection for CellsProj<E, LEN> {
         RegionProj::<E, LEN>::project_write::<MC, M>(&mut state.region, param, value);
     }
 
-    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> i32 {
-        let field_offset: i32 = std::mem::offset_of!(Cells<E, LEN, Owned>, region)
-            .try_into()
-            .expect("Field offset exceeds i32 range");
-        field_offset + RegionProj::<E, LEN>::owned_pointer_offset::<MC>(param)
+    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> ProjectionOffset {
+        let field_offset = std::mem::offset_of!(Cells<E, LEN, Owned>, region);
+
+        RegionProj::<E, LEN>::owned_pointer_offset::<MC>(param) + field_offset
     }
 }
 
 /// Multiple elements of an unspecified type
-pub struct DynCells<const LEN: usize, M: ManagerBase> {
-    region: M::DynRegion<LEN>,
+pub struct DynCells<M: ManagerBase> {
+    region: M::DynRegion,
 }
 
-impl<const LEN: usize, M: ManagerBase> DynCells<LEN, M> {
+impl<M: ManagerBase> DynCells<M> {
+    /// Allocate a new dynamic region with the given length in bytes.
+    pub fn new(len: usize) -> Self
+    where
+        M: ManagerAlloc,
+    {
+        let region = M::allocate_dyn_region(len);
+        Self { region }
+    }
+
     /// Bind this state to the given dynamic region.
-    pub fn bind(region: M::DynRegion<LEN>) -> Self {
+    pub fn bind(region: M::DynRegion) -> Self {
         Self { region }
     }
 
     /// Obtain a reference to the underlying dynamic region.
-    pub fn region_ref(&self) -> &M::DynRegion<LEN> {
+    pub fn region_ref(&self) -> &M::DynRegion {
         &self.region
     }
 
     /// Given a manager morphism `f : &M -> N`, return the layout's allocated structure containing
     /// the constituents of `N` that were produced from the constituents of `&M`.
-    pub fn struct_ref<'a, F: FnManager<Ref<'a, M>>>(&'a self) -> DynCells<LEN, F::Output> {
+    pub fn struct_ref<'a, F: FnManager<Ref<'a, M>>>(&'a self) -> DynCells<F::Output> {
         DynCells {
             region: F::map_dyn_region(&self.region),
         }
     }
 
-    /// Read an element in the region. `address` is in bytes.
-    #[inline]
-    pub fn read<E: Elem>(&self, address: usize) -> E
+    /// Is the dynamic region empty?
+    pub fn is_empty(&self) -> bool
     where
         M: ManagerRead,
     {
-        M::dyn_region_read(&self.region, address)
+        self.len() == 0
+    }
+
+    /// Retrieve the number of bytes in the dynamic region.
+    #[inline]
+    pub fn len(&self) -> usize
+    where
+        M: ManagerRead,
+    {
+        M::dyn_region_len(&self.region)
+    }
+
+    /// Read an element in the region. `address` is in bytes.
+    ///
+    /// # Safety
+    ///
+    /// See [`ManagerRead::dyn_region_read`] for safety requirements.
+    #[inline]
+    pub unsafe fn read<E: Elem>(&self, address: usize) -> E
+    where
+        M: ManagerRead,
+    {
+        unsafe { M::dyn_region_read(&self.region, address) }
     }
 
     /// Read elements from the region. `address` is in bytes.
@@ -621,69 +471,66 @@ impl<const LEN: usize, M: ManagerBase> DynCells<LEN, M> {
     }
 
     /// Update an element in the region. `address` is in bytes.
+    ///
+    /// # Safety
+    ///
+    /// See [`ManagerWrite::dyn_region_write`] for safety requirements.
     #[inline]
-    pub fn write<E: Elem>(&mut self, address: usize, value: E)
+    pub unsafe fn write<E: Elem>(&mut self, address: usize, value: E)
     where
         M: ManagerWrite,
     {
-        M::dyn_region_write(&mut self.region, address, value)
+        unsafe { M::dyn_region_write(&mut self.region, address, value) }
     }
 
     /// Update multiple elements in the region. `address` is in bytes.
     #[inline]
     pub fn write_all<E: Elem + Copy>(&mut self, address: usize, values: &[E])
     where
-        M: ManagerWrite,
+        M: ManagerWrite + ManagerRead,
     {
         M::dyn_region_write_all(&mut self.region, address, values)
     }
 }
 
-impl<const LEN: usize, M: ManagerBase> NewState<M> for DynCells<LEN, M> {
-    fn new() -> Self
-    where
-        M: ManagerAlloc,
-    {
-        let region = M::allocate_dyn_region();
-        Self { region }
+impl<M: ManagerSerialise> Encode for DynCells<M> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        M::serialise_dyn_region(&self.region, encoder)
     }
 }
 
-impl<const LEN: usize, M: ManagerSerialise> serde::Serialize for DynCells<LEN, M> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        M::serialise_dyn_region(&self.region, serializer)
-    }
-}
-
-impl<'de, const LEN: usize, M: ManagerDeserialise> serde::Deserialize<'de> for DynCells<LEN, M> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let region = M::deserialise_dyn_region(deserializer)?;
+impl<M: ManagerDeserialise> Decode<()> for DynCells<M> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let region = M::deserialise_dyn_region(decoder)?;
         Ok(DynCells { region })
     }
 }
 
-impl<const LEN: usize, M: ManagerRead, N: ManagerRead> PartialEq<DynCells<LEN, N>>
-    for DynCells<LEN, M>
-{
-    fn eq(&self, other: &DynCells<LEN, N>) -> bool {
-        for i in 0..LEN {
-            if self.read::<u8>(i) != other.read::<u8>(i) {
-                return false;
+impl<M: ManagerRead, N: ManagerRead> PartialEq<DynCells<N>> for DynCells<M> {
+    fn eq(&self, other: &DynCells<N>) -> bool {
+        let len = self.len();
+
+        if len != other.len() {
+            return false;
+        }
+
+        for i in 0..len {
+            // SAFETY: We know that `i < len` from the loop condition. Therefore, the reads are
+            // always within the maximum bounds.
+            unsafe {
+                if self.read::<u8>(i) != other.read::<u8>(i) {
+                    return false;
+                }
             }
         }
+
         true
     }
 }
 
-impl<const LEN: usize, M: ManagerRead> Eq for DynCells<LEN, M> {}
+impl<M: ManagerRead> Eq for DynCells<M> {}
 
-impl<const LEN: usize, M: ManagerClone> Clone for DynCells<LEN, M> {
+impl<M: ManagerClone> Clone for DynCells<M> {
     fn clone(&self) -> Self {
         Self {
             region: M::clone_dyn_region(&self.region),
@@ -695,7 +542,9 @@ impl<const LEN: usize, M: ManagerClone> Clone for DynCells<LEN, M> {
 pub(crate) mod tests {
     use std::num::NonZeroUsize;
 
-    use serde::ser::SerializeTuple;
+    use bincode::Encode;
+    use bincode::enc::Encoder;
+    use bincode::error::EncodeError;
 
     use crate::backend_test;
     use crate::default::ConstDefault;
@@ -717,15 +566,11 @@ pub(crate) mod tests {
         const DEFAULT: Self = Self { a: 0, b: 0 };
     }
 
-    impl serde::Serialize for Flipper {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            let mut serializer = serializer.serialize_tuple(2)?;
-            serializer.serialize_element(&self.b)?;
-            serializer.serialize_element(&self.a)?;
-            serializer.end()
+    impl Encode for Flipper {
+        fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+            self.b.encode(encoder)?;
+            self.a.encode(encoder)?;
+            Ok(())
         }
     }
 
@@ -823,24 +668,28 @@ pub(crate) mod tests {
         test_dynregion_oob_2,
         F,
         {
-            const LEN: usize = 8;
+            const LEN: usize = 4096;
 
-            let mut state = DynCells::<LEN, F>::new();
+            let mut state = DynCells::<F>::new(LEN);
 
             // This should panic because we are trying to write an element at the address which
             // corresponds to the end of the buffer.
-            state.write(LEN * Flipper::STORED_SIZE.get(), Flipper { a: 1, b: 2 });
+            unsafe {
+                state.write(LEN * Flipper::STORED_SIZE.get(), Flipper { a: 1, b: 2 });
+            }
         }
     );
 
     backend_test!(test_dynregion_stored_format, F, {
         // Writing to one item of the region must convert to stored format.
-        let mut region = DynCells::<1024, F>::new();
+        let mut region = DynCells::<F>::new(4096);
 
-        region.write(0, Flipper { a: 13, b: 37 });
-        assert_eq!(region.read::<Flipper>(0), Flipper { a: 13, b: 37 });
+        unsafe {
+            region.write(0, Flipper { a: 13, b: 37 });
+            assert_eq!(region.read::<Flipper>(0), Flipper { a: 13, b: 37 });
+        }
 
-        let buffer = region.read::<[u8; 2]>(0);
+        let buffer = unsafe { region.read::<[u8; 2]>(0) };
         assert_eq!(buffer, [37, 13]);
 
         // Writing to the entire region must convert properly to stored format.
@@ -860,7 +709,7 @@ pub(crate) mod tests {
             Flipper { a: 17, b: 28 },
         ]);
 
-        let buffer = region.read::<[u8; 8]>(0);
+        let buffer = unsafe { region.read::<[u8; 8]>(0) };
         assert_eq!(buffer, [22, 11, 24, 13, 26, 15, 28, 17]);
     });
 }

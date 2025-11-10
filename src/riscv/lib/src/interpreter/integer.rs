@@ -63,11 +63,7 @@ pub fn run_mv(icb: &mut impl ICB, rd_rs1: NonZeroXRegister, rs2: NonZeroXRegiste
 pub fn run_nop(_icb: &mut impl ICB) {}
 
 /// Perform `val(rs1) + val(rs2)` and store the result in `rd`
-///
-/// Relevant RISC-V opcodes:
-/// - ADD
-/// - C.ADD
-pub fn run_add(
+pub fn run_x64_add(
     icb: &mut impl ICB,
     rs1: NonZeroXRegister,
     rs2: NonZeroXRegister,
@@ -94,12 +90,8 @@ pub fn run_add_word(icb: &mut impl ICB, rs1: XRegister, rs2: XRegister, rd: NonZ
     write_xregister_nz(icb, rd, res)
 }
 
-/// Perform [`val(rs1) - val(rs2)`] and store the result in `rd`
-///
-/// Relevant RISC-V opcodes:
-/// - SUB
-/// - C.SUB
-pub fn run_sub(
+/// Perform `val(rs1) - val(rs2)` and store the result in `rd`
+pub fn run_x64_sub(
     icb: &mut impl ICB,
     rs1: NonZeroXRegister,
     rs2: NonZeroXRegister,
@@ -131,11 +123,7 @@ pub fn run_sub_word(icb: &mut impl ICB, rs1: XRegister, rs2: XRegister, rd: NonZ
     write_xregister_nz(icb, rd, res)
 }
 /// Saves in `rd` the bitwise AND between the value in `rs1` and `rs2`
-///
-/// Relevant RISC-V opcodes:
-/// - `AND`
-/// - `C.AND`
-pub fn run_and(
+pub fn run_x64_and(
     icb: &mut impl ICB,
     rs1: NonZeroXRegister,
     rs2: NonZeroXRegister,
@@ -149,11 +137,7 @@ pub fn run_and(
 }
 
 /// Saves in `rd` the bitwise OR between the value in `rs1` and `rs2`
-///
-/// Relevant RISC-V opcodes:
-/// - `OR`
-/// - `C.OR`
-pub fn run_or(
+pub fn run_x64_or(
     icb: &mut impl ICB,
     rs1: NonZeroXRegister,
     rs2: NonZeroXRegister,
@@ -396,7 +380,7 @@ pub fn run_x64_div_signed(
     let zero = icb.xvalue_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue, _, _>(
+    let result = icb.if_then_else::<XValue, _, _>(
         cond,
         |icb| icb.xvalue_of_imm(-1),
         |icb| {
@@ -407,7 +391,7 @@ pub fn run_x64_div_signed(
             let cond2 = rval1.compare(minimum, Predicate::Equal, icb);
             let cond = icb.bool_and(cond1, cond2);
 
-            icb.branch_merge::<XValue, _, _>(
+            icb.if_then_else::<XValue, _, _>(
                 cond,
                 |icb| icb.xvalue_of_imm(i64::MIN),
                 |icb| rval1.div_signed(rval2, icb),
@@ -434,7 +418,7 @@ pub fn run_x64_div_unsigned(
     let zero = icb.xvalue_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue, _, _>(
+    let result = icb.if_then_else::<XValue, _, _>(
         cond,
         |icb| icb.xvalue_of_imm(!0),
         |icb| rval1.div_unsigned(rval2, icb),
@@ -464,7 +448,7 @@ pub fn run_x32_div_signed(
     let zero = icb.xvalue32_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue32, _, _>(
+    let result = icb.if_then_else::<XValue32, _, _>(
         cond,
         |icb| icb.xvalue32_of_imm(-1),
         |icb| {
@@ -475,7 +459,7 @@ pub fn run_x32_div_signed(
             let cond2 = rval1.compare(minimum, Predicate::Equal, icb);
             let cond = icb.bool_and(cond1, cond2);
 
-            icb.branch_merge::<XValue32, _, _>(
+            icb.if_then_else::<XValue32, _, _>(
                 cond,
                 |icb| icb.xvalue32_of_imm(i32::MIN),
                 |icb| rval1.div_signed(rval2, icb),
@@ -509,7 +493,7 @@ pub fn run_x32_div_unsigned(
     let zero = icb.xvalue32_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue32, _, _>(
+    let result = icb.if_then_else::<XValue32, _, _>(
         cond,
         |icb| icb.xvalue32_of_imm(!0),
         |icb| rval1.div_unsigned(rval2, icb),
@@ -522,13 +506,8 @@ pub fn run_x32_div_unsigned(
 
 /// Shift bits in `rs1` by `shift_amount = val(rs2)\[5:0\]` in the method specified by `shift`
 /// saving the result in `rd`.
-///
-/// Relevant opcodes:
-/// - `SLL`
-/// - `SRL`
-/// - `SRA`
 #[inline]
-pub fn run_shift(
+pub fn run_x64_shift(
     icb: &mut impl ICB,
     shift: Shift,
     rs1: NonZeroXRegister,
@@ -547,16 +526,8 @@ pub fn run_shift(
 
 /// Shift bits in `rs1` by `shift_amount = imm` in the method specified by `shift`
 /// saving the result in `rd`.
-///
-/// Relevant opcodes:
-/// - `SLLI`
-/// - `SRLI`
-/// - `SRAI`
-/// - `C.SLLI`
-/// - `C.SRLI`
-/// - `C.SRAI`
 #[inline]
-pub fn run_shift_immediate(
+pub fn run_x64_shift_imm(
     icb: &mut impl ICB,
     shift: Shift,
     imm: i64,
@@ -595,7 +566,7 @@ pub fn run_x32_shift(
 
 /// Shift only lowest 32 bits in `rs1` by `shift_amount = imm` in the method specified by `shift`
 /// saving the result in `rd`.
-pub fn run_x32_shift_immediate(
+pub fn run_x32_shift_imm(
     icb: &mut impl ICB,
     shift: Shift,
     rs1: NonZeroXRegister,
@@ -633,7 +604,7 @@ pub fn run_x64_rem_signed(
     let zero = icb.xvalue_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue, _, _>(
+    let result = icb.if_then_else::<XValue, _, _>(
         cond,
         |_icb| rval1,
         |icb| {
@@ -644,7 +615,7 @@ pub fn run_x64_rem_signed(
             let cond2 = rval1.compare(minimum, Predicate::Equal, icb);
             let cond = icb.bool_and(cond1, cond2);
 
-            icb.branch_merge::<XValue, _, _>(
+            icb.if_then_else::<XValue, _, _>(
                 cond,
                 |_icb| zero,
                 |icb| rval1.modulus_signed(rval2, icb),
@@ -671,7 +642,7 @@ pub fn run_x64_rem_unsigned(
     let zero = icb.xvalue_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue, _, _>(
+    let result = icb.if_then_else::<XValue, _, _>(
         cond,
         |_icb| rval1,
         |icb| rval1.modulus_unsigned(rval2, icb),
@@ -699,7 +670,7 @@ pub fn run_x32_rem_signed(
     let zero = icb.xvalue32_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue32, _, _>(
+    let result = icb.if_then_else::<XValue32, _, _>(
         cond,
         |_icb| rval1,
         |icb| {
@@ -710,7 +681,7 @@ pub fn run_x32_rem_signed(
             let cond2 = rval1.compare(minimum, Predicate::Equal, icb);
             let cond = icb.bool_and(cond1, cond2);
 
-            icb.branch_merge::<XValue32, _, _>(
+            icb.if_then_else::<XValue32, _, _>(
                 cond,
                 |_icb| zero,
                 |icb| rval1.modulus_signed(rval2, icb),
@@ -741,7 +712,7 @@ pub fn run_x32_rem_unsigned(
     let zero = icb.xvalue32_of_imm(0);
     let cond = rval2.compare(zero, Predicate::Equal, icb);
 
-    let result = icb.branch_merge::<XValue32, _, _>(
+    let result = icb.if_then_else::<XValue32, _, _>(
         cond,
         |_icb| rval1,
         |icb| rval1.modulus_unsigned(rval2, icb),
@@ -790,7 +761,7 @@ mod tests {
         }
     });
 
-    backend_test!(test_add_mv, F, {
+    backend_test!(test_x64_add_mv, F, {
         let imm_rs1_res = [
             (0_i64, 0_u64, 0_u64),
             (0, 0xFFF0_0420, 0xFFF0_0420),
@@ -806,14 +777,14 @@ mod tests {
             state.hart.xregisters.write_nz(nz::a3, rs1);
             state.hart.xregisters.write_nz(nz::a4, imm as u64);
 
-            run_add(&mut state, nz::a3, nz::a4, nz::a3);
+            run_x64_add(&mut state, nz::a3, nz::a4, nz::a3);
             assert_eq!(state.hart.xregisters.read_nz(nz::a3), res);
             run_mv(&mut state, nz::a4, nz::a3);
             assert_eq!(state.hart.xregisters.read_nz(nz::a4), res);
         }
     });
 
-    backend_test!(test_add_sub, F, {
+    backend_test!(test_x64_add_sub, F, {
         let imm_rs1_rd_res = [
             (0_i64, 0_u64, nz::t3, 0_u64),
             (0, 0xFFF0_0420, nz::t2, 0xFFF0_0420),
@@ -840,15 +811,15 @@ mod tests {
             state.hart.xregisters.write_nz(nz::t0, imm as u64);
             run_addi(&mut state, imm, nz::a0, rd);
             assert_eq!(state.hart.xregisters.read_nz(rd), res);
-            run_add(&mut state, nz::a0, nz::t0, nz::a0);
+            run_x64_add(&mut state, nz::a0, nz::t0, nz::a0);
             assert_eq!(state.hart.xregisters.read_nz(nz::a0), res);
             // test sub with: res - imm = rs1 and res - rs1 = imm
             state.hart.xregisters.write_nz(nz::a0, res);
             state.hart.xregisters.write_nz(nz::t0, imm as u64);
-            run_sub(&mut state, nz::a0, nz::t0, nz::a1);
+            run_x64_sub(&mut state, nz::a0, nz::t0, nz::a1);
             assert_eq!(state.hart.xregisters.read_nz(nz::a1), rs1);
             // now rs1 is in register a1
-            run_sub(&mut state, nz::a0, nz::a1, nz::a1);
+            run_x64_sub(&mut state, nz::a0, nz::a1, nz::a1);
             assert_eq!(state.hart.xregisters.read_nz(nz::a1), imm as u64);
         }
     });
@@ -869,6 +840,29 @@ mod tests {
                 state.hart.xregisters.read(a1),
                 v1_u32.wrapping_sub(v2_u32) as i32 as i64 as u64
             );
+        });
+    });
+
+    backend_test!(test_bitwise_reg, F, {
+        proptest!(|(v1 in any::<u64>(), v2 in any::<u64>())| {
+            let mut state = MachineCoreState::<M4K, F>::new();
+
+            state.hart.xregisters.write(a0, v1);
+            state.hart.xregisters.write(t3, v2);
+            run_x64_and(&mut state, nz::t3, nz::a0, nz::a1);
+            prop_assert_eq!(state.hart.xregisters.read(a1), v1 & v2);
+
+            state.hart.xregisters.write(a0, v1);
+            state.hart.xregisters.write(t3, v2);
+            run_x64_or(&mut state, nz::t3, nz::a0, nz::a0);
+            prop_assert_eq!(state.hart.xregisters.read(a0), v1 | v2);
+
+            // Same register
+            state.hart.xregisters.write(a0, v1);
+            run_x64_and(&mut state, nz::a0, nz::a0, nz::a1);
+            prop_assert_eq!(state.hart.xregisters.read(a1), v1);
+            run_x64_or(&mut state, nz::a0, nz::a0, nz::a1);
+            prop_assert_eq!(state.hart.xregisters.read(a1), v1);
         });
     });
 
@@ -896,19 +890,19 @@ mod tests {
         }
     });
 
-    macro_rules! test_shift_instr {
+    macro_rules! test_x64_shift_imm_instr {
         ($state:ident, $shift:expr, $imm:expr,
             $rs1:ident, $r1_val:expr,
             $rd:ident, $expected_val:expr
         ) => {
             $state.hart.xregisters.write_nz(nz::$rs1, $r1_val);
-            run_shift_immediate(&mut $state, $shift, $imm, nz::$rs1, nz::$rd);
+            run_x64_shift_imm(&mut $state, $shift, $imm, nz::$rs1, nz::$rd);
             let new_val = $state.hart.xregisters.read($rd);
             assert_eq!(new_val, $expected_val);
         };
     }
 
-    macro_rules! test_shift_reg_instr {
+    macro_rules! test_x64_shift_reg_instr {
         ($state:ident, $shift:expr,
             $rs2:ident, $r2_val:expr,
             $rs1:ident, $r1_val:expr,
@@ -916,19 +910,19 @@ mod tests {
         ) => {
             $state.hart.xregisters.write($rs2, $r2_val);
             $state.hart.xregisters.write($rs1, $r1_val);
-            run_shift(&mut $state, $shift, nz::$rs1, nz::$rs2, nz::$rd);
+            run_x64_shift(&mut $state, $shift, nz::$rs1, nz::$rs2, nz::$rd);
             let new_val = $state.hart.xregisters.read($rd);
             assert_eq!(new_val, $expected_val);
         };
     }
 
-    macro_rules! test_both_shift_instr {
+    macro_rules! test_both_x64_shift_instr {
         ($state:ident, $shift_reg:expr,
             $rs2:ident, $r2_val:expr,
             $rs1:ident, $r1_val:expr,
             $rd:ident, $expected_val:expr
         ) => {
-            test_shift_instr!(
+            test_x64_shift_imm_instr!(
                 $state,
                 $shift_reg,
                 $r2_val,
@@ -937,7 +931,7 @@ mod tests {
                 $rd,
                 $expected_val
             );
-            test_shift_reg_instr!(
+            test_x64_shift_reg_instr!(
                 $state,
                 $shift_reg,
                 $rs2,
@@ -950,12 +944,12 @@ mod tests {
         };
     }
 
-    backend_test!(test_shift, F, {
+    backend_test!(test_x64_shift, F, {
         let mut state = MachineCoreState::<M4K, F>::new();
 
         // imm = 0
-        test_both_shift_instr!(state, Shift::Left, t0, 0, a0, 0x1234_ABEF, a1, 0x1234_ABEF);
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(state, Shift::Left, t0, 0, a0, 0x1234_ABEF, a1, 0x1234_ABEF);
+        test_both_x64_shift_instr!(
             state,
             Shift::RightUnsigned,
             t1,
@@ -965,7 +959,7 @@ mod tests {
             a0,
             0x1234_ABEF
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightSigned,
             t3,
@@ -977,7 +971,7 @@ mod tests {
         );
 
         // small imm (< 32))
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::Left,
             a2,
@@ -987,7 +981,7 @@ mod tests {
             a1,
             0x1_234A_BEF0_0000
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightUnsigned,
             a2,
@@ -997,7 +991,7 @@ mod tests {
             a1,
             0x1104_8D2A
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightUnsigned,
             a2,
@@ -1007,7 +1001,7 @@ mod tests {
             a0,
             0x0003_FFFF_FFFF_FFFF
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightSigned,
             t0,
@@ -1019,7 +1013,7 @@ mod tests {
         );
 
         // big imm (>= 32))
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::Left,
             t0,
@@ -1029,7 +1023,7 @@ mod tests {
             a0,
             0x34AB_EF00_0000_0000
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightUnsigned,
             a1,
@@ -1039,7 +1033,7 @@ mod tests {
             a0,
             0x0
         );
-        test_both_shift_instr!(
+        test_both_x64_shift_instr!(
             state,
             Shift::RightSigned,
             a2,
@@ -1051,7 +1045,7 @@ mod tests {
         );
 
         // Use same register for shift and source
-        test_shift_reg_instr!(
+        test_x64_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1062,7 +1056,7 @@ mod tests {
             0x12A0_0000
         );
         // Use same register for shift and destination
-        test_shift_reg_instr!(
+        test_x64_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1073,7 +1067,7 @@ mod tests {
             0x1AA0_0000
         );
         // Use same register for shift, source and destination
-        test_shift_reg_instr!(
+        test_x64_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1085,19 +1079,19 @@ mod tests {
         );
     });
 
-    macro_rules! test_shift_word_imm_instr {
+    macro_rules! test_x32_shift_imm_instr {
         ($state:ident, $shift:expr, $imm:expr,
             $rs1:ident, $r1_val:expr,
             $rd:ident, $expected_val:expr
         ) => {
             $state.hart.xregisters.write_nz(nz::$rs1, $r1_val);
-            run_x32_shift_immediate(&mut $state, $shift, nz::$rs1, $imm, nz::$rd);
+            run_x32_shift_imm(&mut $state, $shift, nz::$rs1, $imm, nz::$rd);
             let new_val = $state.hart.xregisters.read($rd);
             assert_eq!(new_val, $expected_val);
         };
     }
 
-    macro_rules! test_shift_word_reg_instr {
+    macro_rules! test_x32_shift_reg_instr {
         ($state:ident, $shift:expr,
             $rs2:ident, $r2_val:expr,
             $rs1:ident, $r1_val:expr,
@@ -1111,14 +1105,14 @@ mod tests {
         };
     }
 
-    macro_rules! test_both_shift_word_instr {
+    macro_rules! test_both_x32_shift_instr {
         ($state:ident, $shift:expr,
             $rs2:ident, $r2_val:expr,
             $rs1:ident, $r1_val:expr,
             $rd:ident, $expected_val:expr
         ) => {
-            test_shift_word_imm_instr!($state, $shift, $r2_val, $rs1, $r1_val, $rd, $expected_val);
-            test_shift_word_reg_instr!(
+            test_x32_shift_imm_instr!($state, $shift, $r2_val, $rs1, $r1_val, $rd, $expected_val);
+            test_x32_shift_reg_instr!(
                 $state,
                 $shift,
                 $rs2,
@@ -1131,10 +1125,10 @@ mod tests {
         };
     }
 
-    backend_test!(test_shift_word, F, {
+    backend_test!(test_x32_shift, F, {
         let mut state = MachineCoreState::<M4K, F>::new();
 
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::Left,
             t0,
@@ -1144,7 +1138,7 @@ mod tests {
             a1,
             0x1234_ABEF
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightUnsigned,
             t0,
@@ -1154,7 +1148,7 @@ mod tests {
             a0,
             0x1234_ABEF
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightSigned,
             a2,
@@ -1164,7 +1158,7 @@ mod tests {
             a1,
             0x1234_ABEF
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::Left,
             a3,
@@ -1174,7 +1168,7 @@ mod tests {
             a0,
             0xFFFF_FFFF_FFF0_0000
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightUnsigned,
             t0,
@@ -1184,7 +1178,7 @@ mod tests {
             a1,
             0x4_8D2A
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightUnsigned,
             a1,
@@ -1194,7 +1188,7 @@ mod tests {
             a0,
             0xFFFF
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightSigned,
             a1,
@@ -1204,7 +1198,7 @@ mod tests {
             a0,
             0xFFFF_FFFF_FFFF_FC3F
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::Left,
             t0,
@@ -1214,7 +1208,7 @@ mod tests {
             a0,
             0xFFFF_FFFF_8000_0000
         );
-        test_both_shift_word_instr!(
+        test_both_x32_shift_instr!(
             state,
             Shift::RightSigned,
             t2,
@@ -1224,7 +1218,7 @@ mod tests {
             a1,
             0xFFFF_FFFF_FFFF_FFFF
         );
-        test_shift_word_reg_instr!(
+        test_x32_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1234,7 +1228,7 @@ mod tests {
             a2,
             0x12A0_0000
         );
-        test_shift_word_reg_instr!(
+        test_x32_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1244,7 +1238,7 @@ mod tests {
             a1,
             0x1AA0_0000
         );
-        test_shift_word_reg_instr!(
+        test_x32_shift_reg_instr!(
             state,
             Shift::Left,
             a1,
@@ -1256,7 +1250,7 @@ mod tests {
         );
     });
 
-    backend_test!(test_bitwise_intruction, F, {
+    backend_test!(test_bitwise_instruction, F, {
         proptest!(|(val1 in any::<u64>(), val2 in any::<u64>())| {
             let mut state = MachineCoreState::<M4K, F>::new();
 

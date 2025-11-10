@@ -1,8 +1,8 @@
 [package]
 name = "octez-riscv"
-version = "0.0.0"
-edition = "2024"
-rust-version = "1.86.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -23,8 +23,6 @@ num_enum.workspace = true
 paste.workspace = true
 libsecp256k1.workspace = true
 rustc_apfloat.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 strum.workspace = true
@@ -40,6 +38,11 @@ range-collections.workspace = true
 elf.workspace = true
 trait-set.workspace = true
 memmap2.workspace = true
+blake3.workspace = true
+perfect-derive.workspace = true
+zerocopy.workspace = true
+zerocopy-derive.workspace = true
+octez-riscv-data.workspace = true
 
 [dependencies.__tracing_do_not_use_directly]
 workspace = true
@@ -51,8 +54,8 @@ proptest.workspace = true
 lazy_static.workspace = true
 tempfile.workspace = true
 goldenfile.workspace = true
+octez-riscv-test-utils.workspace = true
 
 [features]
 default = []
-metrics = []
 log = ["dep:__tracing_do_not_use_directly"]

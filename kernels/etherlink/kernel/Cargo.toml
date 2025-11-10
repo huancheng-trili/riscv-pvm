@@ -1,0 +1,25 @@
+[package]
+name = "etherlink"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+hex.workspace = true
+tezos-smart-rollup.workspace = true
+
+[dependencies.evm_kernel]
+workspace = true
+features = []
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies.evm_kernel]
+workspace = true
+features = ["dummy-store-get-hash"]
+
+[dependencies.tracing-subscriber]
+workspace = true
+optional = true
+
+[features]
+default = ["evm_kernel/debug"]
+tracing = ["evm_kernel/tracing", "dep:tracing-subscriber"]
+static-inbox = []

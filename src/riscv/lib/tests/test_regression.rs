@@ -1,25 +1,28 @@
 // SPDX-FileCopyrightText: 2024 TriliTech <contact@trili.tech>
+// SPDX-FileCopyrightText: 2025 Nomadic Labs <contact@nomadic-labs.com>
 //
 // SPDX-License-Identifier: MIT
+
+// This ensures that Clippy does't apply rules which are allowed in tests.
+#![cfg(test)]
 
 use std::fs;
 use std::io::Write;
 use std::ops::Bound;
-use std::path::Path;
 use std::path::PathBuf;
 
-use octez_riscv::machine_state::block_cache::DefaultCacheConfig;
-use octez_riscv::machine_state::block_cache::block::Block;
-use octez_riscv::machine_state::block_cache::block::Interpreted;
-use octez_riscv::machine_state::block_cache::block::InterpretedBlockBuilder;
-use octez_riscv::machine_state::block_cache::block::Jitted;
-use octez_riscv::machine_state::block_cache::block::OutlineCompiler;
 use octez_riscv::machine_state::memory::M64M;
+use octez_riscv::machine_state::page_cache::CodePageEntry;
+use octez_riscv::machine_state::page_cache::Interpreted;
+use octez_riscv::machine_state::page_cache::InterpretedCompiler;
+use octez_riscv::machine_state::page_cache::Jitted;
+use octez_riscv::machine_state::page_cache::OutlineCompiler;
 use octez_riscv::pvm::hooks::PvmHooks;
 use octez_riscv::state_backend::owned_backend::Owned;
 use octez_riscv::stepper::Stepper;
 use octez_riscv::stepper::StepperStatus;
 use octez_riscv::stepper::pvm::PvmStepper;
+use octez_riscv_test_utils::*;
 use tezos_smart_rollup_utils::inbox::InboxBuilder;
 
 /// [`PvmHooks`] that direct the debug log of the PVM into a golden file
@@ -44,46 +47,29 @@ impl PvmHooks for MintCaptureHooks {
 }
 
 #[test]
-fn regression_frozen_jstz() {
-    test_regression(
-        "tests/expected/jstz",
-        "../assets/jstz",
-        "../assets/regression-inbox.json",
-        true,
-    )
-}
-
-#[test]
 fn regression_frozen_dummy_kernel() {
-    test_regression(
-        "tests/expected/dummy",
-        "../assets/riscv-dummy.elf",
-        "../assets/dummy-kernel-inbox.json",
-        true,
-    )
+    test_regression(DUMMY, true)
 }
 
 #[test]
 fn regression_dummy_kernel() {
-    test_regression(
-        "tests/expected/dummy-volatile",
-        "../riscv-dummy.elf",
-        "../assets/dummy-kernel-inbox.json",
-        false,
-    )
+    test_regression(DUMMY_UNCHECKED, false)
 }
 
-fn test_regression(
-    golden_dir: impl AsRef<Path>,
-    kernel_path: impl AsRef<Path>,
-    inbox_path: impl AsRef<Path>,
-    capture_volatile_properties: bool,
-) {
+#[test]
+fn regression_frozen_jstz() {
+    test_regression(JSTZ, true)
+}
+
+#[test]
+fn regression_frozen_etherlink() {
+    test_regression(ETHERLINK, true)
+}
+
+fn test_regression(inputs: TestConfig, capture_volatile_properties: bool) {
     test_regression_for_block::<Interpreted<M64M, Owned>>(
-        InterpretedBlockBuilder,
-        &golden_dir,
-        &kernel_path,
-        &inbox_path,
+        InterpretedCompiler,
+        &inputs,
         capture_volatile_properties,
     );
 
@@ -91,30 +77,26 @@ fn test_regression(
     // checking and updating the golden files.
     test_regression_for_block::<Jitted<_, _>>(
         OutlineCompiler::<M64M>::default(),
-        &golden_dir,
-        &kernel_path,
-        &inbox_path,
+        &inputs,
         capture_volatile_properties,
     );
 }
 
-fn test_regression_for_block<B: Block<M64M, Owned>>(
-    block_builder: B::BlockBuilder,
-    golden_dir: impl AsRef<Path>,
-    kernel_path: impl AsRef<Path>,
-    inbox_path: impl AsRef<Path>,
+fn test_regression_for_block<CPE: CodePageEntry<M64M, Owned>>(
+    compiler: CPE::Compiler,
+    inputs: &TestConfig,
     capture_volatile_properties: bool,
 ) {
-    let mut mint = goldenfile::Mint::new(golden_dir);
+    let mut mint = goldenfile::Mint::new(inputs.golden_dir);
 
     let (result, initial_hash, final_hash) = {
         // We need to read the kernel in any case
-        let program = fs::read(kernel_path)
+        let program = fs::read(inputs.kernel_path)
             .expect("Failed to read kernel from disk. Try running `make build`.");
 
         let inbox = {
             let mut inbox = InboxBuilder::new();
-            inbox.load_from_file(inbox_path).unwrap();
+            inbox.load_from_file(inputs.inbox_path).unwrap();
             inbox.build()
         };
 
@@ -126,14 +108,14 @@ fn test_regression_for_block<B: Block<M64M, Owned>>(
         ];
         const ORIGINATION_LEVEL: u32 = 1;
 
-        let mut stepper = PvmStepper::<_, M64M, DefaultCacheConfig, Owned, B>::new(
+        let mut stepper = PvmStepper::<_, M64M, Owned, CPE>::new(
             &program,
             inbox,
             hooks,
             ROLLUP_ADDRESS,
             ORIGINATION_LEVEL,
-            Some(PathBuf::from("../assets/preimages").into_boxed_path()),
-            block_builder,
+            Some(PathBuf::from("../../../assets/preimages").into_boxed_path()),
+            compiler,
         )
         .unwrap();
 

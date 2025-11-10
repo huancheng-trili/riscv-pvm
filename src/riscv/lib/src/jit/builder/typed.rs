@@ -12,23 +12,25 @@
 //! in the type system without runtime overhead. It provides safe conversion functions
 //! and operations that preserve type safety across IR transformations.
 
-use std::cmp::Ordering;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
+use cranelift::codegen::ir::MemFlags;
 use cranelift::codegen::ir::Type as CraneliftType;
 use cranelift::codegen::ir::Value as CraneliftValue;
+use cranelift::prelude::FunctionBuilder;
+use cranelift::prelude::InstBuilder;
 use cranelift::prelude::isa::TargetFrontendConfig;
 use cranelift::prelude::types::I8;
 use cranelift::prelude::types::I16;
 use cranelift::prelude::types::I32;
 use cranelift::prelude::types::I64;
+use perfect_derive::perfect_derive;
 
 /// Cranelift IR type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    /// Basic Cranelift type (e.g. intergers)
+    /// Basic Cranelift type (e.g. integers)
     Basic(CraneliftType),
 
     /// Target-dependent pointer type
@@ -100,7 +102,7 @@ impl<T> Typed for &mut T {
 }
 
 /// Strongly-typed IR value
-#[derive(Debug)]
+#[perfect_derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Value<T> {
     /// Underlying Cranelift value
     value: CraneliftValue,
@@ -115,6 +117,28 @@ impl<T> Value<T> {
     ///
     /// The caller must ensure the type `T` is correct for the given Cranelift value.
     pub unsafe fn from_raw(value: CraneliftValue) -> Self {
+        Value {
+            value,
+            _pd: PhantomData,
+        }
+    }
+
+    /// Construct a new typed value for an enum from its discriminant.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the discriminant corresponds to a valid variant of the enum.
+    pub unsafe fn from_discriminant(
+        target_config: &TargetFrontendConfig,
+        builder: &mut FunctionBuilder,
+        discriminant: i64,
+    ) -> Self
+    where
+        T: Typed,
+    {
+        let value = builder
+            .ins()
+            .iconst(T::TYPE.to_type(target_config), discriminant);
         Value {
             value,
             _pd: PhantomData,
@@ -195,53 +219,12 @@ impl<T: Sized> Value<NonNull<T>> {
             _pd: PhantomData,
         }
     }
-}
 
-impl<T> Value<NonNull<MaybeUninit<T>>> {
-    /// Treat the pointee `T` as initialised.
-    ///
-    /// # Safety
-    ///
-    /// You must ensure that the pointee is indeed initialised before using it.
-    pub unsafe fn assume_init(self) -> Value<NonNull<T>> {
-        Value {
-            value: self.value,
-            _pd: PhantomData,
-        }
-    }
-}
-
-// The deriver macro imposes `T: Copy` on `Value<T>`. We don't want that, so we write our own impl.
-impl<T> Copy for Value<T> {}
-
-// See `impl Copy` for why we hand-write this impl.
-impl<T> Clone for Value<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-// See `impl Copy` for why we hand-write this impl.
-impl<T> PartialEq for Value<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.value.eq(&other.value)
-    }
-}
-
-// See `impl Copy` for why we hand-write this impl.
-impl<T> Eq for Value<T> {}
-
-// See `impl Copy` for why we hand-write this impl.
-impl<T> PartialOrd for Value<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-// See `impl Copy` for why we hand-write this impl.
-impl<T> Ord for Value<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.value.cmp(&other.value)
+    /// Write a value to the memory location pointed to by this pointer.
+    pub fn write(self, builder: &mut FunctionBuilder, value: Value<T>) {
+        builder
+            .ins()
+            .store(MemFlags::trusted(), value.to_value(), self.to_value(), 0);
     }
 }
 

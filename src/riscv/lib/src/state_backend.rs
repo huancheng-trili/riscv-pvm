@@ -72,9 +72,7 @@
 
 pub mod clone_layout;
 mod commitment_layout;
-mod effects;
 mod elems;
-pub mod hash;
 mod layout;
 pub mod owned_backend;
 pub mod proof_backend;
@@ -85,11 +83,17 @@ pub mod verify_backend;
 
 use std::marker::PhantomData;
 
+use bincode::de::Decode;
+use bincode::de::Decoder;
+use bincode::enc::Encode;
+use bincode::enc::Encoder;
+use bincode::error::DecodeError;
+use bincode::error::EncodeError;
 pub use clone_layout::*;
 pub use commitment_layout::*;
-pub use effects::*;
 pub use elems::*;
 pub use layout::*;
+pub use octez_riscv_data::hash;
 pub use proof_layout::*;
 pub use region::*;
 pub use trans::*;
@@ -97,38 +101,8 @@ pub use trans::*;
 use crate::machine_state::memory::MemoryConfig;
 use crate::state_context::projection::ApplyCons;
 use crate::state_context::projection::Projection;
+use crate::state_context::projection::ProjectionOffset;
 use crate::state_context::projection::RegionCons;
-
-/// An enriched value may be stored in a [`ManagerBase::EnrichedCell`].
-///
-/// This allows a value to have an additional, derived, value attached - that may be expensive
-/// to derive lazily.
-///
-/// This derived value does not form part of any stored state/commitments.
-pub trait EnrichedValue {
-    /// Type of the stored value which we want to enrich
-    type E: 'static;
-
-    /// Type of the derived value that enriches the stored value
-    type D;
-}
-
-/// Specifies that there exists a path to derive `V::D` from `&V::E`
-pub trait EnrichedValueLinked: EnrichedValue {
-    /// Construct the derived value from the stored value, maps to
-    /// the `From` trait by default.
-    fn derive(v: &Self::E) -> Self::D;
-}
-
-impl<Value> EnrichedValueLinked for Value
-where
-    Value: EnrichedValue,
-    Value::D: for<'a> From<&'a Value::E>,
-{
-    fn derive(v: &Self::E) -> Self::D {
-        v.into()
-    }
-}
 
 /// Manager of the state backend storage
 pub trait ManagerBase: Sized {
@@ -136,14 +110,9 @@ pub trait ManagerBase: Sized {
     type Region<E: 'static, const LEN: usize>;
 
     /// Dynamic region represents a fixed-sized byte vector that has been allocated in the state storage
-    type DynRegion<const LEN: usize>;
+    type DynRegion;
 
-    /// An [enriched] value may have a derived value attached.
-    ///
-    /// [enriched]: EnrichedValue
-    type EnrichedCell<V: EnrichedValue>;
-
-    /// The root manager may either be itself, or occassionally the manager that this manager
+    /// The root manager may either be itself, or occasionally the manager that this manager
     /// wraps.
     ///
     /// For example, the [`Ref`] backend is often use to wrap the [`Owned`] backend to gain access
@@ -151,12 +120,6 @@ pub trait ManagerBase: Sized {
     ///
     /// [`Owned`]: owned_backend::Owned
     type ManagerRoot: ManagerBase<ManagerRoot = Self::ManagerRoot>;
-
-    /// Upgrade a single-element region to an enriched cell.
-    fn enrich_cell<V: EnrichedValueLinked>(cell: Self::Region<V::E, 1>) -> Self::EnrichedCell<V>;
-
-    /// Obtain a reference to the underlying region of an enriched cell.
-    fn as_devalued_cell<V: EnrichedValue>(cell: &Self::EnrichedCell<V>) -> &Self::Region<V::E, 1>;
 }
 
 /// Manager with allocation capabilities
@@ -168,7 +131,7 @@ pub trait ManagerAlloc: 'static + ManagerReadWrite {
     fn allocate_region<E, const LEN: usize>(init_value: [E; LEN]) -> Self::Region<E, LEN>;
 
     /// Allocate a dynamic region in the state storage.
-    fn allocate_dyn_region<const LEN: usize>() -> Self::DynRegion<LEN>;
+    fn allocate_dyn_region(len: usize) -> Self::DynRegion;
 }
 
 /// Manager with read capabilities
@@ -182,35 +145,50 @@ pub trait ManagerRead: ManagerBase {
     /// Read all elements in the region.
     fn region_read_all<E: Copy, const LEN: usize>(region: &Self::Region<E, LEN>) -> Vec<E>;
 
+    /// Read the length of the dynamic region in bytes.
+    fn dyn_region_len(region: &Self::DynRegion) -> usize;
+
     /// Read an element in the region. `address` is in bytes.
-    fn dyn_region_read<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-    ) -> E;
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the access is within bounds.
+    ///
+    /// ```
+    /// address + E:STORED <= region.len()
+    /// ```
+    unsafe fn dyn_region_read<E: Elem>(region: &Self::DynRegion, address: usize) -> E;
 
     /// Read elements from the region. `address` is in bytes.
-    fn dyn_region_read_all<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-        values: &mut [E],
-    );
+    ///
+    /// # Panics
+    ///
+    /// Panics if the read would go out of bounds.
+    fn dyn_region_read_all<E: Elem>(region: &Self::DynRegion, address: usize, values: &mut [E]) {
+        if values.is_empty() {
+            return;
+        }
 
-    /// Read the value contained in the enriched cell.
-    fn enriched_cell_read_stored<V>(cell: &Self::EnrichedCell<V>) -> V::E
-    where
-        V: EnrichedValue,
-        V::E: Copy;
+        assert!(
+            values
+                .len()
+                .checked_mul(E::STORED_SIZE.get())
+                .expect("Total length should not overflow")
+                .checked_add(address)
+                .expect("End address should not overflow")
+                <= Self::dyn_region_len(region),
+        );
 
-    /// Read the derived value of the enriched cell.
-    fn enriched_cell_read_derived<V>(cell: &Self::EnrichedCell<V>) -> V::D
-    where
-        V: EnrichedValueLinked,
-        V::D: Copy;
-
-    /// Obtain a reference to the value contained in the enriched cell.
-    fn enriched_cell_ref_stored<V>(cell: &Self::EnrichedCell<V>) -> &V::E
-    where
-        V: EnrichedValue;
+        for (i, value) in values.iter_mut().enumerate() {
+            // SAFETY: The assertion above ensures all reads are within bounds.
+            unsafe {
+                *value = Self::dyn_region_read::<E>(
+                    region,
+                    E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
+                )
+            };
+        }
+    }
 }
 
 /// Manager with write capabilities
@@ -226,23 +204,53 @@ pub trait ManagerWrite: ManagerBase<ManagerRoot = Self> {
     fn region_write_all<E: Copy, const LEN: usize>(region: &mut Self::Region<E, LEN>, value: &[E]);
 
     /// Update an element in the region. `address` is in bytes.
-    fn dyn_region_write<E: Elem, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
-        address: usize,
-        value: E,
-    );
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the access is within bounds.
+    ///
+    /// ```
+    /// address + E:STORED <= region.len()
+    /// ```
+    unsafe fn dyn_region_write<E: Elem>(region: &mut Self::DynRegion, address: usize, value: E);
 
     /// Update multiple elements in the region. `address` is in bytes.
-    fn dyn_region_write_all<E: Elem + Copy, const LEN: usize>(
-        region: &mut Self::DynRegion<LEN>,
+    ///
+    /// # Panics
+    ///
+    /// Panics if the write would go out of bounds.
+    fn dyn_region_write_all<E: Elem + Copy>(
+        region: &mut Self::DynRegion,
         address: usize,
         values: &[E],
-    );
+    ) where
+        Self: ManagerRead,
+    {
+        if values.is_empty() {
+            return;
+        }
 
-    /// Update the value contained in an enriched cell. The derived value will be recalculated.
-    fn enriched_cell_write<V>(cell: &mut Self::EnrichedCell<V>, value: V::E)
-    where
-        V: EnrichedValueLinked;
+        assert!(
+            values
+                .len()
+                .checked_mul(E::STORED_SIZE.get())
+                .expect("Total length should not overflow")
+                .checked_add(address)
+                .expect("End address should not overflow")
+                <= Self::dyn_region_len(region)
+        );
+
+        for (i, value) in values.iter().enumerate() {
+            // SAFETY: The assertion above ensures all writes are within bounds.
+            unsafe {
+                Self::dyn_region_write::<E>(
+                    region,
+                    E::STORED_SIZE.get().wrapping_mul(i).wrapping_add(address),
+                    *value,
+                );
+            }
+        }
+    }
 }
 
 /// Manager with capabilities that require both read and write
@@ -258,34 +266,27 @@ pub trait ManagerReadWrite: ManagerRead + ManagerWrite {
 /// Manager with the ability to serialise regions
 pub trait ManagerSerialise: ManagerRead {
     /// Serialise the contents of the region.
-    fn serialise_region<E: serde::Serialize, const LEN: usize, S: serde::Serializer>(
-        region: &Self::Region<E, LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>;
+    fn serialise_region<T: Encode, const LEN: usize, E: Encoder>(
+        region: &Self::Region<T, LEN>,
+        encoder: E,
+    ) -> Result<(), EncodeError>;
 
     /// Serialise the contents of the dynamic region.
-    fn serialise_dyn_region<const LEN: usize, S: serde::Serializer>(
-        region: &Self::DynRegion<LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>;
+    fn serialise_dyn_region<E: Encoder>(
+        region: &Self::DynRegion,
+        encoder: E,
+    ) -> Result<(), EncodeError>;
 }
 
 /// Manager with the ability to deserialise regions
 pub trait ManagerDeserialise: ManagerBase {
     /// Deserialise a region.
-    fn deserialise_region<
-        'de,
-        E: serde::Deserialize<'de>,
-        const LEN: usize,
-        D: serde::Deserializer<'de>,
-    >(
-        deserializer: D,
-    ) -> Result<Self::Region<E, LEN>, D::Error>;
+    fn deserialise_region<T: Decode<()>, const LEN: usize, D: Decoder<Context = ()>>(
+        decoder: D,
+    ) -> Result<Self::Region<T, LEN>, DecodeError>;
 
-    /// Deserialise the dyanmic region.
-    fn deserialise_dyn_region<'de, const LEN: usize, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self::DynRegion<LEN>, D::Error>;
+    /// Deserialise the dynamic region.
+    fn deserialise_dyn_region<D: Decoder>(decoder: D) -> Result<Self::DynRegion, DecodeError>;
 }
 
 /// Manager with the ability to clone regions
@@ -296,14 +297,7 @@ pub trait ManagerClone: ManagerBase {
     ) -> Self::Region<E, LEN>;
 
     /// Clone the dynamic region.
-    fn clone_dyn_region<const LEN: usize>(region: &Self::DynRegion<LEN>) -> Self::DynRegion<LEN>;
-
-    /// Clone the enriched cell.
-    fn clone_enriched_cell<V>(cell: &Self::EnrichedCell<V>) -> Self::EnrichedCell<V>
-    where
-        V: EnrichedValue,
-        V::E: Clone,
-        V::D: Clone;
+    fn clone_dyn_region(region: &Self::DynRegion) -> Self::DynRegion;
 }
 
 /// Manager wrapper around `M` whose regions are immutable references to regions of `M`
@@ -312,34 +306,24 @@ pub struct Ref<'backend, M>(std::marker::PhantomData<fn(&'backend M)>);
 impl<'backend, M: ManagerBase> ManagerBase for Ref<'backend, M> {
     type Region<E: 'static, const LEN: usize> = &'backend M::Region<E, LEN>;
 
-    type DynRegion<const LEN: usize> = &'backend M::DynRegion<LEN>;
-
-    type EnrichedCell<V: EnrichedValue> = &'backend M::Region<V::E, 1>;
+    type DynRegion = &'backend M::DynRegion;
 
     type ManagerRoot = M::ManagerRoot;
-
-    fn enrich_cell<V: EnrichedValueLinked>(cell: Self::Region<V::E, 1>) -> Self::EnrichedCell<V> {
-        cell
-    }
-
-    fn as_devalued_cell<V: EnrichedValue>(cell: &Self::EnrichedCell<V>) -> &Self::Region<V::E, 1> {
-        cell
-    }
 }
 
 impl<M: ManagerSerialise> ManagerSerialise for Ref<'_, M> {
-    fn serialise_region<E: serde::Serialize, const LEN: usize, S: serde::Serializer>(
-        region: &Self::Region<E, LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        M::serialise_region(region, serializer)
+    fn serialise_region<T: Encode, const LEN: usize, E: Encoder>(
+        region: &Self::Region<T, LEN>,
+        encoder: E,
+    ) -> Result<(), EncodeError> {
+        M::serialise_region(region, encoder)
     }
 
-    fn serialise_dyn_region<const LEN: usize, S: serde::Serializer>(
-        region: &Self::DynRegion<LEN>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        M::serialise_dyn_region(region, serializer)
+    fn serialise_dyn_region<E: Encoder>(
+        region: &Self::DynRegion,
+        encoder: E,
+    ) -> Result<(), EncodeError> {
+        M::serialise_dyn_region(region, encoder)
     }
 }
 
@@ -356,42 +340,16 @@ impl<M: ManagerRead> ManagerRead for Ref<'_, M> {
         M::region_read_all(region)
     }
 
-    fn dyn_region_read<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-    ) -> E {
-        M::dyn_region_read(region, address)
+    fn dyn_region_len(region: &Self::DynRegion) -> usize {
+        M::dyn_region_len(region)
     }
 
-    fn dyn_region_read_all<E: Elem, const LEN: usize>(
-        region: &Self::DynRegion<LEN>,
-        address: usize,
-        values: &mut [E],
-    ) {
+    unsafe fn dyn_region_read<E: Elem>(region: &Self::DynRegion, address: usize) -> E {
+        unsafe { M::dyn_region_read(region, address) }
+    }
+
+    fn dyn_region_read_all<E: Elem>(region: &Self::DynRegion, address: usize, values: &mut [E]) {
         M::dyn_region_read_all(region, address, values)
-    }
-
-    fn enriched_cell_read_stored<V>(cell: &Self::EnrichedCell<V>) -> V::E
-    where
-        V: EnrichedValue,
-        V::E: Copy,
-    {
-        M::region_read(cell, 0)
-    }
-
-    fn enriched_cell_ref_stored<V>(cell: &Self::EnrichedCell<V>) -> &V::E
-    where
-        V: EnrichedValue,
-    {
-        M::region_ref(cell, 0)
-    }
-
-    fn enriched_cell_read_derived<V>(cell: &Self::EnrichedCell<V>) -> V::D
-    where
-        V: EnrichedValueLinked,
-        V::D: Copy,
-    {
-        V::derive(M::region_ref(cell, 0))
     }
 }
 
@@ -450,17 +408,19 @@ impl<E: 'static, const LEN: usize> Projection for RegionProj<E, LEN> {
         M::region_write(state, param.0, value);
     }
 
-    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> i32 {
+    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> ProjectionOffset {
         assert!(
             param.0 < LEN,
             "Region index out of bounds: {} >= {}",
             param.0,
             LEN
         );
-        std::mem::size_of::<E>()
-            .wrapping_mul(param.0)
-            .try_into()
-            .expect("Region offset exceeds i32 range")
+
+        let offset = std::mem::size_of::<E>()
+            .checked_mul(param.0)
+            .expect("Region offset exceeds usize range");
+
+        ProjectionOffset::direct(offset)
     }
 }
 
@@ -471,6 +431,7 @@ pub(crate) mod test_helpers {
     use super::ManagerAlloc;
     use super::ManagerClone;
     use super::ManagerReadWrite;
+    use crate::machine_state::test_helpers::ManagerTestInit;
 
     /// Generate a test against all test backends.
     #[macro_export]
@@ -479,11 +440,18 @@ pub(crate) mod test_helpers {
             $(#[$m])*
             #[test]
             fn $name() {
-                fn inner<$fac_name: $crate::state_backend::test_helpers::TestBackendFactory>() {
+                use $crate::state_backend::owned_backend::Owned;
+                use $crate::state_backend::proof_backend::ProofGen;
+                use $crate::state_backend::verify_backend::Verifier;
+                use $crate::state_backend::test_helpers::TestBackendFactory;
+
+                fn inner<$fac_name: TestBackendFactory>() {
                     $expr
                 }
 
-                inner::<$crate::state_backend::owned_backend::Owned>();
+                inner::<Owned>();
+                inner::<ProofGen<Owned>>();
+                inner::<Verifier>();
             }
         };
     }
@@ -494,7 +462,9 @@ pub(crate) mod test_helpers {
         /// Used for testing.
         pub trait TestBackendFactory = ManagerReadWrite
             + ManagerClone
-            + ManagerAlloc;
+            + ManagerAlloc
+            + ManagerTestInit
+            ;
     }
 }
 
@@ -506,6 +476,7 @@ mod tests {
     use crate::state_backend::Cells;
     use crate::state_backend::FnManagerIdent;
     use crate::state_backend::owned_backend::Owned;
+    use crate::storage::binary;
 
     #[test]
     fn test_example_owned() {
@@ -529,7 +500,7 @@ mod tests {
         assert_eq!(instance.second.read_all(), second_value);
 
         let first_value_read = u64::from_le_bytes(
-            bincode::serialize(&instance.first.struct_ref::<FnManagerIdent>())
+            binary::serialise(instance.first.struct_ref::<FnManagerIdent>())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -537,7 +508,7 @@ mod tests {
         assert_eq!(first_value_read, first_value);
 
         let second_value_read = unsafe {
-            let data = bincode::serialize(&instance.second.struct_ref::<FnManagerIdent>()).unwrap();
+            let data = binary::serialise(instance.second.struct_ref::<FnManagerIdent>()).unwrap();
             data.as_ptr().cast::<[u32; 4]>().read().map(u32::from_le)
         };
         assert_eq!(second_value_read, second_value);

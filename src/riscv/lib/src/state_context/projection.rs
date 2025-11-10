@@ -10,6 +10,15 @@
 //! different memory configurations and state backend managers.
 
 use std::marker::PhantomData;
+use std::ops::Deref;
+use std::ops::DerefMut;
+
+use cranelift::codegen::ir;
+use cranelift::codegen::ir::immediates::Offset32;
+use cranelift::prelude::FunctionBuilder;
+use cranelift::prelude::InstBuilder;
+use cranelift::prelude::MemFlags;
+use cranelift::prelude::isa::TargetFrontendConfig;
 
 use crate::machine_state::MachineCoreState;
 use crate::machine_state::memory::MemoryConfig;
@@ -18,6 +27,7 @@ use crate::state_backend::Cells;
 use crate::state_backend::ManagerBase;
 use crate::state_backend::ManagerRead;
 use crate::state_backend::ManagerWrite;
+use crate::state_backend::owned_backend::Owned;
 
 /// Helper for type equality for higher-kinded types
 ///
@@ -39,6 +49,20 @@ pub trait TypeCons {
 
 /// Apply a type constructor `TC` to memory config `MC` and manager `M`.
 pub type ApplyCons<TC, MC, M> = <TC as TypeCons>::Applied<MC, M>;
+
+/// Type constructor [`Box`]
+pub struct BoxCons<T>(PhantomData<T>);
+
+impl<T: TypeCons> TypeCons for BoxCons<T> {
+    type Applied<MC: MemoryConfig, M: ManagerBase> = Box<ApplyCons<T, MC, M>>;
+}
+
+/// Type constructor `[T; LEN]`
+pub struct ArrayCons<T, const LEN: usize>(PhantomData<T>);
+
+impl<T: TypeCons, const LEN: usize> TypeCons for ArrayCons<T, LEN> {
+    type Applied<MC: MemoryConfig, M: ManagerBase> = [ApplyCons<T, MC, M>; LEN];
+}
 
 /// Type constructor [`ManagerBase::Region`]
 pub struct RegionCons<E, const LEN: usize>(PhantomData<E>);
@@ -68,6 +92,103 @@ impl TypeCons for MachineCoreCons {
     type Applied<MC: MemoryConfig, M: ManagerBase> = MachineCoreState<MC, M>;
 }
 
+/// Offset from a base pointer to a [projection's] subject, within the owned backend.
+///
+/// Additional offsets may be added to an existing one, to build up offsets within
+/// layered projections. All such additions will panic on overflowing the `i32` range.
+///
+/// [projection's]: Projection
+#[derive(Debug, Clone)]
+pub enum ProjectionOffset {
+    /// Target value is directly accessible from the base pointer
+    ///
+    /// Adding the offset to the base pointer will yield the address of the target value.
+    Direct {
+        /// Offset from the base in bytes
+        offset: i32,
+    },
+
+    /// Target value is accessible via an indirection
+    ///
+    /// Adding the offset to the base pointer will yield the address of the next base pointer. The
+    /// `inner` projection then needs to proceed with the new base pointer.
+    Indirect {
+        /// Offset from the base in bytes
+        offset: i32,
+
+        /// Inner projection to be applied after resolving the indirection
+        inner: Box<ProjectionOffset>,
+    },
+}
+
+impl ProjectionOffset {
+    /// Create a new projection offset from the given offset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the offset overflows the `i32` range.
+    pub fn direct(offset: usize) -> Self {
+        let offset = offset
+            .try_into()
+            .expect("Projection offset overflows i32 range");
+        Self::Direct { offset }
+    }
+
+    /// Resolve the projection offset to a base pointer and an offset relative to the base. Adding
+    /// the offset to the base pointer will yield the address of the target value.
+    pub fn build_base_and_offset(
+        &self,
+        target_config: &TargetFrontendConfig,
+        builder: &mut FunctionBuilder,
+        base: ir::Value,
+    ) -> (ir::Value, Offset32) {
+        match self {
+            ProjectionOffset::Direct { offset } => {
+                let offset = Offset32::new(*offset);
+                (base, offset)
+            }
+
+            ProjectionOffset::Indirect { offset, inner } => {
+                let new_base = builder.ins().load(
+                    target_config.pointer_type(),
+                    MemFlags::trusted(),
+                    base,
+                    *offset,
+                );
+                inner.build_base_and_offset(target_config, builder, new_base)
+            }
+        }
+    }
+}
+
+impl std::ops::Add<usize> for ProjectionOffset {
+    type Output = Self;
+
+    fn add(self, offset: usize) -> Self {
+        let offset: u32 = offset
+            .try_into()
+            .expect("Projection offset overflows u32 range");
+
+        match self {
+            ProjectionOffset::Direct { offset: raw_offset } => ProjectionOffset::Direct {
+                offset: raw_offset
+                    .checked_add_unsigned(offset)
+                    .expect("Projection offset overflow"),
+            },
+
+            ProjectionOffset::Indirect {
+                offset: base_offset,
+                inner,
+            } => ProjectionOffset::Indirect {
+                offset: base_offset
+                    .checked_add_unsigned(offset)
+                    .expect("Projection offset overflow"),
+                inner,
+            },
+        }
+    }
+}
+
 /// Projections give you access to a value of the target type within the value of a subject type.
 pub trait Projection {
     /// Subject that contains the target value
@@ -81,7 +202,7 @@ pub trait Projection {
     /// For example, this could be an index when the projection is selecting an element from an
     /// array. In practise this can be any kind of information that is required to perform the
     /// projection.
-    type Parameter: tuples::Tuple;
+    type Parameter;
 
     /// Obtain a reference to the target value within the subject value.
     fn project_ref<'a, MC: MemoryConfig, M: ManagerRead + 'a>(
@@ -108,7 +229,118 @@ pub trait Projection {
     /// offset to an address of the subject value that would give you the address of the target
     /// value. This is exclusive to the [`crate::state_backend::owned_backend::Owned`] state
     /// backend.
-    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> i32;
+    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> ProjectionOffset;
+}
+
+/// A projection from [`Box`] to its inner type
+pub struct BoxProj<P>(P);
+
+impl<P: Projection> Projection for BoxProj<P> {
+    type Subject = BoxCons<P::Subject>;
+
+    type Target = P::Target;
+
+    type Parameter = P::Parameter;
+
+    fn project_ref<'a, MC: MemoryConfig, M: ManagerRead + 'a>(
+        state: &'a ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+    ) -> &'a Self::Target {
+        P::project_ref::<MC, M>(state.deref(), param)
+    }
+
+    fn project_read<'a, MC: MemoryConfig, M: ManagerRead + 'a>(
+        state: &'a ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+    ) -> Self::Target
+    where
+        Self::Target: Copy,
+    {
+        P::project_read::<MC, M>(state.deref(), param)
+    }
+
+    fn project_write<'a, MC: MemoryConfig, M: ManagerWrite + 'a>(
+        state: &'a mut ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+        value: Self::Target,
+    ) {
+        P::project_write::<MC, M>(state.deref_mut(), param, value);
+    }
+
+    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> ProjectionOffset {
+        let offset = P::owned_pointer_offset::<MC>(param);
+        ProjectionOffset::Indirect {
+            offset: 0,
+            inner: Box::new(offset),
+        }
+    }
+}
+
+/// Parameter for an array projection
+pub struct ArrayProjParam<T> {
+    /// Index of the element to project
+    pub index: usize,
+
+    /// Parameter for the inner projection
+    pub inner_param: T,
+}
+
+/// A projection from an array to one of its elements
+pub struct ArrayProj<P, const LEN: usize>(P);
+
+impl<P: Projection, const LEN: usize> Projection for ArrayProj<P, LEN> {
+    type Subject = ArrayCons<P::Subject, LEN>;
+
+    type Target = P::Target;
+
+    type Parameter = ArrayProjParam<P::Parameter>;
+
+    fn project_ref<'a, MC: MemoryConfig, M: ManagerRead + 'a>(
+        state: &'a ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+    ) -> &'a Self::Target {
+        let inner_state = &state[param.index];
+        P::project_ref::<MC, M>(inner_state, param.inner_param)
+    }
+
+    fn project_read<'a, MC: MemoryConfig, M: ManagerRead + 'a>(
+        state: &'a ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+    ) -> Self::Target
+    where
+        Self::Target: Copy,
+    {
+        let inner_state = &state[param.index];
+        P::project_read::<MC, M>(inner_state, param.inner_param)
+    }
+
+    fn project_write<'a, MC: MemoryConfig, M: ManagerWrite + 'a>(
+        state: &'a mut ApplyCons<Self::Subject, MC, M>,
+        param: Self::Parameter,
+        value: Self::Target,
+    ) {
+        let inner_state = &mut state[param.index];
+        P::project_write::<MC, M>(inner_state, param.inner_param, value);
+    }
+
+    fn owned_pointer_offset<MC: MemoryConfig>(param: Self::Parameter) -> ProjectionOffset {
+        assert!(
+            param.index < LEN,
+            "Array index out of bounds: {} >= {}",
+            param.index,
+            LEN
+        );
+
+        let inner_offset = P::owned_pointer_offset::<MC>(param.inner_param);
+
+        let elem_size = std::mem::size_of::<<P::Subject as TypeCons>::Applied<MC, Owned>>();
+        let offset = param
+            .index
+            .checked_mul(elem_size)
+            .expect("Array index overflow");
+
+        inner_offset + offset
+    }
 }
 
 /// Implement a projection by pre-composing a field access to an existing projection.
@@ -178,16 +410,17 @@ macro_rules! impl_projection {
 
             fn owned_pointer_offset<MC: $crate::machine_state::memory::MemoryConfig>(
                 param: Self::Parameter
-            ) -> i32 {
-                let field_offset: i32 = std::mem::offset_of!(
+            ) -> $crate::state_context::projection::ProjectionOffset {
+                let field_offset = std::mem::offset_of!(
                     $crate::state_context::projection::ApplyCons<
                         $subject,
                         MC,
                         $crate::state_backend::owned_backend::Owned
                     >,
                     $($field).+
-                ).try_into().expect("Field offset exceeds i32 range");
-                field_offset + <$target>::owned_pointer_offset::<MC>(param)
+                );
+
+                <$target>::owned_pointer_offset::<MC>(param) + field_offset
             }
         }
     };
