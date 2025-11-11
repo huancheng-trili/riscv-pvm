@@ -144,7 +144,7 @@ impl<MC: MemoryConfig, CPE: CodePageEntry<MC, M>, M: state_backend::ManagerBase>
     /// the given [compiler].
     ///
     /// [compiler]: CodePageEntry::Compiler
-    pub(crate) fn bind(
+    pub fn bind(
         space: state_backend::AllocatedOf<PvmLayout<MC>, M>,
         compiler: CPE::Compiler,
     ) -> Self
@@ -166,7 +166,7 @@ impl<MC: MemoryConfig, CPE: CodePageEntry<MC, M>, M: state_backend::ManagerBase>
 
     /// Given a manager morphism `f : &M -> N`, return the layout's allocated structure containing
     /// the constituents of `N` that were produced from the constituents of `&M`.
-    pub(crate) fn struct_ref<'a, F: state_backend::FnManager<state_backend::Ref<'a, M>>>(
+    pub fn struct_ref<'a, F: state_backend::FnManager<state_backend::Ref<'a, M>>>(
         &'a self,
     ) -> state_backend::AllocatedOf<PvmLayout<MC>, F::Output> {
         PvmLayoutF {
